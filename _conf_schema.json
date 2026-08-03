@@ -1,0 +1,20 @@
+{
+  "allow_bot_admin": {
+    "type": "bool",
+    "description": "允许 Bot 超级管理员使用",
+    "hint": "开启后，Bot 配置文件中指定的超级管理员可让 Bot 执行禁言指令",
+    "default": true
+  },
+  "allow_group_owner": {
+    "type": "bool",
+    "description": "允许目标群群主使用",
+    "hint": "开启后，当前群聊的群主可让 Bot 执行禁言指令",
+    "default": true
+  },
+  "allow_group_admin": {
+    "type": "bool",
+    "description": "允许目标群管理员使用",
+    "hint": "开启后，当前群聊的管理员可让 Bot 执行禁言指令",
+    "default": true
+  }
+}
