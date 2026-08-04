@@ -1,20 +1,47 @@
 {
-  "allow_bot_admin": {
-    "type": "bool",
-    "description": "允许 Bot 超级管理员使用",
-    "hint": "开启后，Bot 配置文件中指定的超级管理员可让 Bot 执行禁言指令",
-    "default": true
-  },
-  "allow_group_owner": {
-    "type": "bool",
-    "description": "允许目标群群主使用",
-    "hint": "开启后，当前群聊的群主可让 Bot 执行禁言指令",
-    "default": true
-  },
-  "allow_group_admin": {
-    "type": "bool",
-    "description": "允许目标群管理员使用",
-    "hint": "开启后，当前群聊的管理员可让 Bot 执行禁言指令",
-    "default": true
-  }
+    "allow_bot_admin": {
+        "description": "允许 Bot 超级管理员使用",
+        "hint": "开启后，Bot 配置文件中指定的超级管理员可让 Bot 执行群管理指令",
+        "type": "bool",
+        "default": true
+    },
+    "allow_group_owner": {
+        "description": "允许目标群群主使用",
+        "hint": "开启后，当前群聊的群主可让 Bot 执行群管理指令",
+        "type": "bool",
+        "default": true
+    },
+    "allow_group_admin": {
+        "description": "允许目标群管理员使用",
+        "hint": "开启后，当前群聊的管理员可让 Bot 执行群管理指令",
+        "type": "bool",
+        "default": true
+    },
+    "member_allowed_tools": {
+        "description": "允许普通群友使用的功能工具",
+        "hint": "勾选的功能工具将允许普通群友直接指挥 Bot 调用使用",
+        "type": "list",
+        "options": [
+            "读取历史消息",
+            "禁言/解禁",
+            "踢人/拉黑",
+            "清理潜水成员",
+            "撤回消息",
+            "设置/取消精华",
+            "全体禁言",
+            "修改群名片",
+            "设置专属头衔",
+            "设置/取消管理员",
+            "修改群名称",
+            "发布群公告",
+            "获取群信息",
+            "获取全员列表",
+            "查询成员信息",
+            "戳一戳"
+        ],
+        "default": [
+            "戳一戳",
+            "获取群信息"
+        ]
+    }
 }
