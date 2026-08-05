@@ -12,7 +12,7 @@ logger = logging.getLogger("astrbot")
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
     "提供注册给大模型调用的全套 QQ 群管理与互动工具（含禁言、踢人/拉黑、清理潜水人员、撤回、精华、头衔、公告、查询成员资料、戳一戳等 16 大功能），可用自然语言指挥 Bot 进行群管理操作，支持灵活配置管理员权限与普通群友授权功能。",
-    "2.0.1",
+    "2.1.0",
     ""
 )
 class QQGroupAdminPlugin(Star):
@@ -237,47 +237,63 @@ class QQGroupAdminPlugin(Star):
         reason: str = ""
     ) -> str:
         """
-        在 QQ 群聊中撤回某条消息。支持直接撤回当前回复/引用的消息，或撤回指定 message_id 的消息。当且仅当具有管理员权限的用户明确提出撤回要求时调用。
+        在 QQ 群聊中撤回单条或多条指定消息。支持直接撤回当前回复/引用的消息，或指定单个/多个 message_id（以英文逗号或空格分隔，如 '12345,67890'）。当且仅当具有管理员权限的用户明确提出撤回要求时调用。
 
         Args:
-            message_id (str, optional): 要撤回的消息 ID（一串数字）。若为空，工具将自动从用户当前的引用/回复消息中提取消息 ID。
+            message_id (str, optional): 要撤回的消息 ID。可以为单个 ID，或多个用逗号/空格分隔的 ID（如 '12345,67890'）。若为空，工具将自动从用户当前的引用/回复消息中提取消息 ID。
             reason (str, optional): 撤回消息的原因或说明。
         """
         ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="delete_group_message")
         if not ok:
             return err_msg
 
-        target_msg_id = message_id.strip()
+        target_msg_id_input = message_id.strip()
 
-        if not target_msg_id and hasattr(event, "get_messages"):
+        # 尝试从 Reply 提取
+        if not target_msg_id_input and hasattr(event, "get_messages"):
             try:
                 from astrbot.api.message_components import Reply
                 for component in event.get_messages():
                     if isinstance(component, Reply):
-                        target_msg_id = str(component.id)
+                        target_msg_id_input = str(component.id)
                         break
             except Exception as e:
                 logger.debug(f"[QQGroupAdmin] 提取 Reply 组件时跳过: {e}")
 
-        if not target_msg_id:
+        if not target_msg_id_input:
             return "操作失败：无法获取要撤回的消息 ID。请回复/引用要撤回的那条消息并让 Bot 撤回，或明确提供消息 ID。"
 
-        try:
-            await self._call_onebot_action(
-                event,
-                "delete_msg",
-                message_id=int(target_msg_id) if target_msg_id.isdigit() else target_msg_id
-            )
-            
-            reason_desc = f"（原因：{reason}）" if reason else ""
-            return f"成功：由 [{auth_role}] 发起，已成功撤回消息 (ID: {target_msg_id}){reason_desc}。"
+        # 解析可能存在的多个 ID (支持逗号、空格、分号分隔)
+        raw_ids = [i.strip() for i in re.split(r"[,;\s]+", target_msg_id_input) if i.strip()]
+        if not raw_ids:
+            return "操作失败：未提供有效的消息 ID。"
 
-        except Exception as e:
-            err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 delete_msg 失败: {err_str}")
-            if "102" in err_str or "权限" in err_str or "Permission" in err_str:
-                return f"执行失败：Bot 自身在群 {group_id} 中缺乏管理员权限或消息超出可撤回时限，无法撤回消息 (ID: {target_msg_id})。"
-            return f"执行撤回消息 API 时出错：{err_str}"
+        success_ids = []
+        failed_ids = []
+        reason_desc = f"（原因：{reason}）" if reason else ""
+
+        for m_id in raw_ids:
+            try:
+                await self._call_onebot_action(
+                    event,
+                    "delete_msg",
+                    message_id=int(m_id) if m_id.isdigit() else m_id
+                )
+                success_ids.append(m_id)
+            except Exception as e:
+                err_str = str(e)
+                logger.error(f"[QQGroupAdmin] 执行 delete_msg (ID: {m_id}) 失败: {err_str}")
+                failed_ids.append(m_id)
+
+        if success_ids and not failed_ids:
+            if len(success_ids) == 1:
+                return f"成功：由 [{auth_role}] 发起，已成功撤回消息 (ID: {success_ids[0]}){reason_desc}。"
+            else:
+                return f"成功：由 [{auth_role}] 发起，已批量撤回 {len(success_ids)} 条消息 (IDs: {', '.join(success_ids)}){reason_desc}。"
+        elif success_ids and failed_ids:
+            return f"部分成功：由 [{auth_role}] 发起，已成功撤回 {len(success_ids)} 条消息 ({', '.join(success_ids)})，但有 {len(failed_ids)} 条撤回失败 ({', '.join(failed_ids)}){reason_desc}。"
+        else:
+            return f"执行失败：Bot 自身在群 {group_id} 中缺乏管理员权限或消息超出 2 分钟撤回时限，无法撤回消息 (IDs: {', '.join(failed_ids)})。"
 
     @llm_tool(name="set_group_essence_message")
     async def set_group_essence_message(
@@ -735,13 +751,13 @@ class QQGroupAdminPlugin(Star):
         Args:
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
         """
+        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="group_poke")
+        if not ok:
+            return f"操作失败：{err_msg}"
+
         cleaned_target = re.sub(r"\D", "", str(target_user))
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
-
-        group_id = event.get_group_id()
-        if not group_id:
-            return "操作失败：该工具仅支持在 QQ 群聊中使用。"
 
         try:
             try:
@@ -763,7 +779,7 @@ class QQGroupAdminPlugin(Star):
         except Exception as e:
             err_str = str(e)
             logger.error(f"[QQGroupAdmin] 执行 group_poke 失败: {err_str}")
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="group_poke")
+            return f"执行戳一戳失败：{err_str}"
 
 
     @llm_tool(name="get_group_member_info")

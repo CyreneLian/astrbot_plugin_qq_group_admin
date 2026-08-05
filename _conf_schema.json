@@ -7,19 +7,19 @@
     },
     "allow_group_owner": {
         "description": "允许目标群群主使用",
-        "hint": "开启后，当前群聊的群主可让 Bot 执行群管理指令",
+        "hint": "需关闭需要 AstrBot 管理员权限才能使用电脑能力",
         "type": "bool",
         "default": true
     },
     "allow_group_admin": {
         "description": "允许目标群管理员使用",
-        "hint": "开启后，当前群聊的管理员可让 Bot 执行群管理指令",
+        "hint": "需关闭需要 AstrBot 管理员权限才能使用电脑能力",
         "type": "bool",
         "default": true
     },
     "member_allowed_tools": {
         "description": "允许普通群友使用的功能工具",
-        "hint": "勾选的功能工具将允许普通群友直接指挥 Bot 调用使用",
+        "hint": "勾选的功能工具将允许普通群友直接指挥 Bot 调用使用（需关闭需要 AstrBot 管理员权限才能使用电脑能力）",
         "type": "list",
         "options": [
             "读取历史消息",
