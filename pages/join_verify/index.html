@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多群共享黑名单管理</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="page">
+    <header class="page-header">
+      <h1>多群共享黑名单管理</h1>
+      <p class="subtitle">查看和管理各用户已消耗的入群验证次数与黑名单状态，各个群共享入群次数和黑名单，关闭入群人机验证后黑名单防护也会失效</p>
+    </header>
+
+    <section class="overview">
+      <div class="stat-card">
+        <div class="stat-value" id="stat-total">-</div>
+        <div class="stat-label">记录总数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="stat-blacklisted">-</div>
+        <div class="stat-label">黑名单人数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="stat-failures">-</div>
+        <div class="stat-label">累计失败次数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="stat-max">-</div>
+        <div class="stat-label">拉黑阈值</div>
+      </div>
+    </section>
+
+    <div class="note-banner">
+      已拉黑的用户即使调大总次数，剩余机会也恒为 0 次；未拉黑的用户即使调小总次数，也至少保留 1 次入群机会。
+    </div>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>用户记录</h2>
+        <div class="panel-actions">
+          <input type="text" id="input-add-user" class="input-add" placeholder="输入QQ号拉黑" />
+          <button class="btn btn-danger" id="btn-add" onclick="handleAddBlacklist()">拉黑</button>
+          <button class="btn btn-danger" id="btn-clear" onclick="handleClear()">清空全部失败记录</button>
+          <button class="btn" id="btn-refresh" onclick="loadAll()">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>QQ 号</th>
+              <th>失败次数</th>
+              <th>剩余机会</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="user-tbody">
+            <tr><td colspan="5" class="empty">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="toast" id="toast"></div>
+
+    <!-- 操作确认弹窗 -->
+    <div class="modal-mask" id="confirm-modal" style="display:none;">
+      <div class="modal-box">
+        <div class="modal-title">操作确认</div>
+        <div class="modal-text" id="modal-text"></div>
+        <div class="modal-actions">
+          <button class="btn btn-sm" id="modal-cancel">取消</button>
+          <button class="btn btn-sm btn-danger" id="modal-ok">确认</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
