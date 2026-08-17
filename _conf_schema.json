@@ -1,72 +1,163 @@
 {
-    "allow_bot_admin": {
-        "description": "允许 Bot 超级管理员使用",
-        "hint": "开启后，Bot 配置文件中指定的超级管理员可让 Bot 执行群管理指令",
-        "type": "bool",
-        "default": true
-    },
-    "allow_group_admin": {
-        "description": "允许目标群管理员使用",
-        "hint": "需关闭需要 AstrBot 管理员权限才能使用电脑能力",
-        "type": "bool",
-        "default": true
-    },
-    "allow_group_owner": {
-        "description": "允许目标群群主使用",
-        "hint": "需关闭需要 AstrBot 管理员权限才能使用电脑能力",
-        "type": "bool",
-        "default": true
-    },
-    "enable_at_feature": {
-        "description": "允许 @ 成员功能",
-        "hint": "关闭后，大模型将无法在回复中 @ 成员，且 at_all_members 工具将无法使用",
-        "type": "bool",
-        "default": true
-    },
-    "enable_poke_reply": {
-        "description": "允许被戳一戳时自然回复",
-        "hint": "开启后，当有人在群聊或私聊中戳一戳 Bot 时，Bot 将根据角色性格自然回应",
-        "type": "bool",
-        "default": true
-    },
-    "blacklisted_groups": {
-        "type": "list",
-        "default": [],
-        "description": "黑名单群聊列表",
-        "hint": "填入群号（如 12345678），在黑名单列表中的群将完全无法使用本插件的任何功能（包括群管工具、@功能与戳一戳响应）",
+    "群聊管理与互动工具": {
+        "description": "群聊管理与互动工具",
+        "hint": "群管理工具与互动功能的权限控制、功能开关。",
+        "type": "object",
         "items": {
-            "type": "string"
+            "allow_bot_admin": {
+                "description": "允许 Bot 超级管理员使用",
+                "hint": "开启后，Bot 配置文件中指定的超级管理员可让 Bot 执行群管理指令",
+                "type": "bool",
+                "default": true
+            },
+            "allow_group_admin": {
+                "description": "允许目标群管理员使用",
+                "hint": "需关闭需要 AstrBot 管理员权限才能使用电脑能力",
+                "type": "bool",
+                "default": true
+            },
+            "allow_group_owner": {
+                "description": "允许目标群群主使用",
+                "hint": "需关闭需要 AstrBot 管理员权限才能使用电脑能力",
+                "type": "bool",
+                "default": true
+            },
+            "enable_at_feature": {
+                "description": "允许 @ 成员功能",
+                "hint": "关闭后，大模型将无法在回复中 @ 成员，且 at_all_members 工具将无法使用",
+                "type": "bool",
+                "default": true
+            },
+            "enable_poke_reply": {
+                "description": "允许被戳一戳时自然回复",
+                "hint": "开启后，当有人在群聊或私聊中戳一戳 Bot 时，Bot 将根据角色性格自然回应",
+                "type": "bool",
+                "default": true
+            },
+            "enable_group_decrease_notice": {
+                "description": "退群提示开关",
+                "hint": "开启后，有人退群时 Bot 会在群内提示「谁主动退群了」或「谁被管理员/群主移出群聊」。",
+                "type": "bool",
+                "default": true
+            },
+            "member_allowed_tools": {
+                "description": "允许普通群友使用的功能工具",
+                "hint": "勾选的功能工具将允许普通群友直接指挥 Bot 调用使用（需关闭需要 AstrBot 管理员权限才能使用电脑能力）",
+                "type": "list",
+                "default": [
+                    "读取历史消息",
+                    "获取群信息",
+                    "获取全员列表",
+                    "查询成员信息",
+                    "戳一戳"
+                ],
+                "options": [
+                    "读取历史消息",
+                    "禁言/解禁",
+                    "踢人/拉黑",
+                    "清理潜水成员",
+                    "撤回消息",
+                    "设置/取消精华",
+                    "全体禁言",
+                    "修改群名片",
+                    "设置专属头衔",
+                    "设置/取消管理员",
+                    "修改群名称",
+                    "发布群公告",
+                    "获取群信息",
+                    "获取全员列表",
+                    "查询成员信息",
+                    "戳一戳",
+                    "@全体成员"
+                ]
+            }
         }
     },
-    "member_allowed_tools": {
-        "description": "允许普通群友使用的功能工具",
-        "hint": "勾选的功能工具将允许普通群友直接指挥 Bot 调用使用（需关闭需要 AstrBot 管理员权限才能使用电脑能力）",
-        "type": "list",
-        "default": [
-            "读取历史消息",
-            "获取群信息",
-            "获取全员列表",
-            "查询成员信息",
-            "戳一戳"
-        ],
-        "options": [
-            "读取历史消息",
-            "禁言/解禁",
-            "踢人/拉黑",
-            "清理潜水成员",
-            "撤回消息",
-            "设置/取消精华",
-            "全体禁言",
-            "修改群名片",
-            "设置专属头衔",
-            "设置/取消管理员",
-            "修改群名称",
-            "发布群公告",
-            "获取群信息",
-            "获取全员列表",
-            "查询成员信息",
-            "戳一戳",
-            "@全体成员"
-        ]
+    "自动同意入群工具": {
+        "description": "自动同意入群工具",
+        "hint": "开启后，当有人申请加入群聊时，Bot 将根据等级门槛和群聊白词自动同意或拒绝入群。",
+        "type": "object",
+        "items": {
+            "auto_accept_group_request": {
+                "description": "等级达到门槛时自动同意入群",
+                "hint": "开启后，当有人申请加入群聊时，Bot 将根据设置的等级门槛自动同意入群",
+                "type": "bool",
+                "default": false
+            },
+            "auto_reject_below_level": {
+                "description": "等级未达门槛时自动拒绝入群",
+                "hint": "独立功能：即使「等级达到门槛时自动同意入群」未开启也能生效。",
+                "type": "bool",
+                "default": false
+            },
+            "auto_accept_group_level": {
+                "description": "自动同意入群的申请人 QQ 等级门槛",
+                "hint": "填 0 代表不限制等级；填其他数值（如 30）代表仅 QQ 等级 ≥ 该数值的申请人自动同意。",
+                "type": "int",
+                "default": 0
+            },
+            "auto_accept_group_whitelist": {
+                "description": "自动同意入群的白词列表",
+                "hint": "申请人填写的入群验证信息包含任一白词时自动同意入群。可与等级门槛同时开启：同时配置时需「白词命中 + 等级达标」双条件同时满足才会自动同意。留空表示不启用白词功能",
+                "type": "list",
+                "default": [],
+                "items": {
+                    "type": "string"
+                }
+            },
+            "auto_reject_whitelist_miss": {
+                "description": "未命中入群白词时自动拒绝入群",
+                "hint": "开启后，当申请人填写的入群验证信息未包含任何入群白词时，Bot 将自动拒绝入群申请",
+                "type": "bool",
+                "default": false
+            }
+        }
+    },
+    "入群人机验证": {
+        "description": "入群人机验证",
+        "hint": "新人入群后自动发送随机加减法题目，限时回复正确答案即验证成功；回复错误达上限或超时未回复将自动移出群聊。",
+        "type": "object",
+        "items": {
+            "enable_join_verify": {
+                "description": "入群人机验证开关",
+                "hint": "开启后，新人入群时 Bot 将 @新人 发送随机加减法题目进行人机验证，只在 Bot 拥有 管理员 权限的群生效",
+                "type": "bool",
+                "default": false
+            },
+            "join_verify_timeout": {
+                "description": "验证超时时间（秒）",
+                "hint": "新人入群后在此时间内未回复正确答案将被移出群聊",
+                "type": "int",
+                "default": 180
+            },
+            "join_verify_max_attempts": {
+                "description": "最大错误次数",
+                "hint": "回复错误达到此次数后将被移出群聊",
+                "type": "int",
+                "default": 3
+            },
+            "join_verify_max_failures": {
+                "description": "人机验证累计失败次数上限（拉黑阈值）",
+                "hint": "填写后，每次人机验证未通过被踢出群聊后会消耗 1 次次数；累计达到该次数后自动将该用户拉入入群黑名单，并且支持多群共享黑名单。填 0 代表不限制",
+                "type": "int",
+                "default": 0
+            }
+        }
+    },
+    "群聊黑名单": {
+        "description": "群聊黑名单",
+        "hint": "黑名单中的群聊将完全无法使用本插件的任何功能（包括群管工具、@功能与自动入群审核等）。",
+        "type": "object",
+        "items": {
+            "blacklisted_groups": {
+                "type": "list",
+                "default": [],
+                "description": "黑名单群聊列表",
+                "hint": "填入群号（如 12345678），在黑名单列表中的群将完全无法使用本插件的任何功能",
+                "items": {
+                    "type": "string"
+                }
+            }
+        }
     }
 }
