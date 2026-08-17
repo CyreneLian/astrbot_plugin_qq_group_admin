@@ -1,7 +1,7 @@
 name: astrbot_plugin_qq_group_admin
 display_name: QQ群大模型管理工具
-desc: "提供注册给大模型调用的全套 QQ 群管理与互动工具（含禁言、踢人/拉黑、清理潜水人员、@、撤回、精华、头衔、公告、戳一戳等 17 大功能），可用自然语言指挥 Bot 进行群管理操作，支持灵活配置管理员权限与普通群友授权功能。"
-version: 2.2.0
+desc: "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。"
+version: 3.0.0
 astrbot_version: ">=4.26"
 author: 往昔的涟漪
 repo: https://github.com/CyreneLian/astrbot_plugin_qq_group_admin
