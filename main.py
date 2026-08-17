@@ -1,48 +1,112 @@
 """
-AstrBot QQ群大模型管理工具 v2.2.0
+AstrBot QQ群大模型管理工具 v3.0.0
 
 功能描述：
-- 提供注册给大模型调用的全套 QQ 群管理与互动工具（含禁言、踢人/拉黑、清理潜水人员、@、撤回、精华、头衔、公告、戳一戳等 17 大功能）
-- 可用自然语言指挥 Bot 进行群管理操作，支持灵活配置管理员权限与普通群友授权功能
+- 提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。
 
 作者: 往昔的涟漪
-版本: 2.2.0
-日期: 2026-08-08
+版本: 3.0.0
+日期: 2026-08-10
 """
 
-from astrbot.api.message_components import At, Plain, BaseMessageComponent
-from astrbot.api.provider import ProviderRequest
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-import re
+import asyncio
+import json
 import logging
-from typing import Any, List, Tuple
-from astrbot.api.star import Context, Star, register
+import os
+import random
+import re
+import time
+from typing import Any, List
+
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import llm_tool
+from astrbot.api.message_components import At, BaseMessageComponent, Plain
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.star import Context, Star, register
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+from .constants import (
+    AT_INSTRUCTION,
+    AT_PATTERN,
+    LOG_PREFIX,
+    POKE_PROMPT_TEMPLATE,
+)
+from .permission import check_permission
+from .utils import (
+    call_onebot_action,
+    clean_qq_number,
+    extract_reply_message_id,
+    format_group_msg_history,
+    format_member_list,
+    format_timestamp,
+    get_bot_role_in_group,
+    is_blacklisted_group,
+    scan_inactive_members,
+)
 
 logger = logging.getLogger("astrbot")
+
 
 @register(
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
-    "提供注册给大模型调用的全套 QQ 群管理与互动工具（含禁言、踢人/拉黑、清理潜水人员、@、撤回、精华、头衔、公告、戳一戳等 17 大功能），可用自然语言指挥 Bot 进行群管理操作，支持灵活配置管理员权限与普通群友授权功能。",
-    "2.2.0",
+    "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。",
+    "3.0.0",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
 class QQGroupAdminPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
+        # 兼容分组配置（群聊管理与互动工具 / 自动同意入群工具）：
+        # 将各分组内的配置项摊平到顶层，便于各处按原键名读取，同时兼容旧的扁平配置。
+        # 注意：必须通过「创建新字典」合并，绝不能修改传入的 config 对象本身，
+        # 否则会污染 AstrBot 共享的 AstrBotConfig 实例，导致配置面板渲染出多余的扁平配置项。
+        _meta_keys = {"type", "description", "hint", "obvious_hint", "items", "default", "options", "slider"}
+        _flattened = {}
+        for _group_val in list(self.config.values()):
+            if isinstance(_group_val, dict):
+                _items = _group_val.get("items") if isinstance(_group_val.get("items"), dict) else _group_val
+                if isinstance(_items, dict):
+                    for _k, _v in _items.items():
+                        if _k not in _meta_keys:
+                            _flattened[_k] = _v
+        if _flattened:
+            self.config = {**self.config, **_flattened}
+        # 入群审核管理面板 Web API（查看/管理入群失败次数与黑名单）
+        try:
+            from .web import JoinVerifyWebController
+            self._web = JoinVerifyWebController(context, self.config)
+            self._web.register_routes()
+            logger.info(f"{LOG_PREFIX} 入群审核管理面板已注册")
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 注册入群审核管理面板失败: {e}")
+            self._web = None
+
+        # 入群人机验证状态：{(group_id, user_id): {"answer": int, "attempts": int, "max_attempts": int, "task": Task, "event": event}}
+        self._join_verify_state: dict = {}
+        # 入群人机验证黑名单持久化：{user_id: {"failures": int, "blacklisted": bool}}
+        try:
+            self._verify_data_dir = os.path.join(
+                get_astrbot_plugin_data_path(), "astrbot_plugin_qq_group_admin"
+            )
+            os.makedirs(self._verify_data_dir, exist_ok=True)
+            self._verify_blacklist_file = os.path.join(
+                self._verify_data_dir, "join_verify_blacklist.json"
+            )
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 初始化入群黑名单数据目录失败: {e}")
+            self._verify_blacklist_file = ""
         # 从 context 获取 Bot 全局配置中的 admins_id 列表
         try:
             raw_admins = context.get_config().get("admins_id", [])
             self.admins_id = [str(a).strip() for a in raw_admins if a]
         except Exception as e:
-            logger.warning(f"[QQGroupAdmin] 获取 admins_id 失败: {e}")
+            logger.warning(f"{LOG_PREFIX} 获取 admins_id 失败: {e}")
             self.admins_id = []
 
         # 正则表达式：用于匹配符合规范的艾特标签，例如 [at:123456] 或 [at:all]
-        self.valid_at_pattern = re.compile(r"\[at:(\d+|all)\]")
+        self.valid_at_pattern = AT_PATTERN
 
     @filter.on_llm_request()
     async def inject_at_instruction(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -54,19 +118,10 @@ class QQGroupAdminPlugin(Star):
         if not enable_at_feature:
             return
 
-        group_id = event.get_group_id()
-        if group_id:
-            blacklisted_groups = [str(g).strip() for g in self.config.get("blacklisted_groups", []) if g]
-            if str(group_id) in blacklisted_groups:
-                return
+        if is_blacklisted_group(self.config, event.get_group_id()):
+            return
 
-        at_instruction = (
-            "\n\n【艾特成员提示】\n"
-            "当你想在回复中艾特（提及）某个群成员时，请在回复文本中插入格式为 [at:用户ID] 的标签。\n"
-            "例如：你好[at:123456789]，关于你的问题...\n"
-            "其中用户ID必须是纯数字，可以先调用 get_group_member_list 工具查询成员 QQ 号。"
-        )
-        req.system_prompt = (req.system_prompt or "") + at_instruction
+        req.system_prompt = (req.system_prompt or "") + AT_INSTRUCTION
 
     @filter.on_decorating_result(priority=2)
     async def process_at_tags(self, event: AstrMessageEvent):
@@ -76,11 +131,8 @@ class QQGroupAdminPlugin(Star):
         if not self.config.get("enable_at_feature", True):
             return
 
-        group_id = event.get_group_id()
-        if group_id:
-            blacklisted_groups = [str(g).strip() for g in self.config.get("blacklisted_groups", []) if g]
-            if str(group_id) in blacklisted_groups:
-                return
+        if is_blacklisted_group(self.config, event.get_group_id()):
+            return
 
         result = event.get_result()
         if not result or not result.chain:
@@ -158,173 +210,6 @@ class QQGroupAdminPlugin(Star):
 
         result.chain = new_chain
 
-    async def _call_onebot_action(self, event: AstrMessageEvent, action: str, **kwargs) -> Any:
-        """
-        跨版本安全调用 OneBot/aiocqhttp API 的辅助函数
-        """
-        bot = getattr(event, "bot", None)
-        if not bot:
-            raise RuntimeError("当前事件未关联 bot 平台实例。")
-
-        # 优先级 1: event.bot.call_action(action, **kwargs)
-        if hasattr(bot, "call_action") and callable(bot.call_action):
-            return await bot.call_action(action, **kwargs)
-        
-        # 优先级 2: event.bot.api.call_action(action, **kwargs)
-        api = getattr(bot, "api", None)
-        if api and hasattr(api, "call_action") and callable(api.call_action):
-            return await api.call_action(action, **kwargs)
-
-        # 优先级 3: event.bot.call_api(action, kwargs)
-        if hasattr(bot, "call_api") and callable(bot.call_api):
-            try:
-                return await bot.call_api(action, kwargs)
-            except Exception:
-                return await bot.call_api(action, **kwargs)
-
-        raise RuntimeError("当前 Bot 客户端不支持 OneBot call_action API。")
-
-    async def _check_permission(self, event: AstrMessageEvent, tool_name: str = "") -> tuple[bool, str, str, str]:
-        """
-        通用权限检查辅助函数
-        返回: (是否通过, 授权角色描述, 群号, 错误提示文案)
-        """
-        group_id = event.get_group_id()
-        if not group_id:
-            return False, "", "", "操作失败：该工具仅支持在 QQ 群聊中使用，当前并非群聊环境。"
-
-        # 0. 检查群黑名单
-        blacklisted_groups = [str(g).strip() for g in self.config.get("blacklisted_groups", []) if g]
-        if str(group_id) in blacklisted_groups:
-            return False, "", str(group_id), f"拒绝执行：当前群聊 ({group_id}) 已被管理员列入黑名单，插件功能已被禁用。"
-
-        sender_id = str(event.get_sender_id()).strip()
-
-        # 检查是否在允许普通群友调用的工具勾选列表中
-        member_allowed_tools = self.config.get("member_allowed_tools", [
-            "读取历史消息",
-            "获取群信息",
-            "获取全员列表",
-            "查询成员信息",
-            "戳一戳"
-        ])
-        
-        tool_cn_map = {
-            "ban_group_member": "禁言/解禁",
-            "kick_group_member": "踢人/拉黑",
-            "delete_group_message": "撤回消息",
-            "set_group_essence_message": "设置/取消精华",
-            "get_group_msg_history": "读取历史消息",
-            "set_group_whole_ban": "全体禁言",
-            "set_group_card": "修改群名片",
-            "set_group_special_title": "设置专属头衔",
-            "set_group_admin": "设置/取消管理员",
-            "set_group_name": "修改群名称",
-            "send_group_notice": "发布群公告",
-            "get_group_info": "获取群信息",
-            "get_group_member_list": "获取全员列表",
-            "get_group_member_info": "查询成员信息",
-            "kick_inactive_members": "清理潜水成员",
-            "group_poke": "戳一戳",
-            "at_all_members": "@全体成员"
-        }
-        
-        # 兼容匹配：匹配工具中文名或工具英文名
-        is_tool_allowed_for_member = False
-        if tool_name:
-            cn_name = tool_cn_map.get(tool_name, "")
-            for allowed in member_allowed_tools:
-                if allowed == cn_name or allowed == tool_name or allowed.startswith(cn_name) or allowed.startswith(tool_name):
-                    is_tool_allowed_for_member = True
-                    break
-
-        if is_tool_allowed_for_member:
-            return True, "普通群友(配置已授权工具)", str(group_id), ""
-
-        allow_bot_admin = self.config.get("allow_bot_admin", True)
-        allow_group_owner = self.config.get("allow_group_owner", True)
-        allow_group_admin = self.config.get("allow_group_admin", True)
-
-        is_authorized = False
-        auth_role = ""
-
-        # A. 检查 Bot 超级管理员
-        if allow_bot_admin and sender_id in self.admins_id:
-            is_authorized = True
-            auth_role = "Bot 超级管理员"
-
-        # B. 检查群主 / 群管理员
-        if not is_authorized and (allow_group_owner or allow_group_admin):
-            try:
-                member_info = await self._call_onebot_action(
-                    event,
-                    "get_group_member_info",
-                    group_id=int(group_id),
-                    user_id=int(sender_id),
-                    no_cache=True
-                )
-                if isinstance(member_info, dict):
-                    role = member_info.get("role", "")
-                    if role == "owner" and allow_group_owner:
-                        is_authorized = True
-                        auth_role = "群主"
-                    elif role == "admin" and allow_group_admin:
-                        is_authorized = True
-                        auth_role = "群管理员"
-            except Exception as e:
-                logger.error(f"[QQGroupAdmin] 查询发送者 {sender_id} 权限失败: {e}")
-
-        if not is_authorized:
-            return False, "", "", f"拒绝执行：发送者 ({sender_id}) 不具备操作权限（该功能未开放给普通群友，且未满足管理员权限要求）。"
-
-        # C. 校验 Bot 账号自身在群内的身份权限（针对需要群管/群主身份的工具）
-        admin_required_tools = {
-            "ban_group_member": "禁言/解禁",
-            "kick_group_member": "踢人/拉黑",
-            "delete_group_message": "撤回消息",
-            "set_group_essence_message": "设置/取消精华",
-            "set_group_whole_ban": "全体禁言",
-            "set_group_card": "修改群名片",
-            "set_group_name": "修改群名称",
-            "kick_inactive_members": "清理潜水成员",
-        }
-        owner_required_tools = {
-            "set_group_special_title": "设置专属头衔",
-            "set_group_admin": "设置/取消管理员"
-        }
-
-        if tool_name in admin_required_tools or tool_name in owner_required_tools:
-            try:
-                bot_self_id = getattr(event, "self_id", None)
-                if not bot_self_id:
-                    login_info = await self._call_onebot_action(event, "get_login_info")
-                    if isinstance(login_info, dict):
-                        bot_self_id = login_info.get("user_id")
-
-                if bot_self_id:
-                    bot_member_info = await self._call_onebot_action(
-                        event,
-                        "get_group_member_info",
-                        group_id=int(group_id),
-                        user_id=int(bot_self_id),
-                        no_cache=True
-                    )
-                    if isinstance(bot_member_info, dict):
-                        bot_role = str(bot_member_info.get("role", "member")).lower()
-                        tool_cn = admin_required_tools.get(tool_name) or owner_required_tools.get(tool_name)
-                        
-                        if tool_name in owner_required_tools:
-                            if bot_role != "owner":
-                                return False, "", str(group_id), f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏【群主】身份（当前角色为 {bot_role}）。【{tool_cn}】要求 Bot 账号自身必须具备群主身份。"
-                        elif tool_name in admin_required_tools:
-                            if bot_role not in {"owner", "admin"}:
-                                return False, "", str(group_id), f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏管理员或群主权限（当前角色为普通成员）。【{tool_cn}】要求 Bot 账号必须具备群管理员或群主身份。"
-            except Exception as e:
-                logger.warning(f"[QQGroupAdmin] 预检 Bot 账号群权限失败: {e}")
-
-        return True, auth_role, str(group_id), ""
-
-
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_poke(self, event: AstrMessageEvent):
         """
@@ -336,10 +221,8 @@ class QQGroupAdminPlugin(Star):
         raw_msg = getattr(event.message_obj, "raw_message", {})
         raw_dict = raw_msg if isinstance(raw_msg, dict) else {}
         group_id = event.get_group_id() or raw_dict.get("group_id")
-        if group_id:
-            blacklisted_groups = [str(g).strip() for g in self.config.get("blacklisted_groups", []) if g]
-            if str(group_id) in blacklisted_groups:
-                return
+        if is_blacklisted_group(self.config, group_id):
+            return
 
         if event.get_platform_name() != "aiocqhttp":
             return
@@ -365,10 +248,7 @@ class QQGroupAdminPlugin(Star):
             return
 
         username = event.get_sender_name() or str(sender_id)
-        prompt = (
-            f"【系统提示：{username} 刚在聊天中戳了戳你】\n"
-            "请完全契合你的性格角色与灵魂，自然地回应这次“戳一戳”互动。"
-        )
+        prompt = POKE_PROMPT_TEMPLATE.format(username=username)
 
         # 获取 conversation 对象保证上下文连续
         umo = event.unified_msg_origin
@@ -380,9 +260,651 @@ class QQGroupAdminPlugin(Star):
                 cid = await conv_mgr.new_conversation(umo, event.get_platform_id())
             conversation = await conv_mgr.get_conversation(umo, cid)
         except Exception as e:
-            logger.warning(f"[QQGroupAdmin] 戳一戳获取 conversation 失败: {e}")
+            logger.warning(f"{LOG_PREFIX} 戳一戳获取 conversation 失败: {e}")
 
         yield event.request_llm(prompt=prompt, conversation=conversation)
+
+    async def _get_user_nickname(self, event: AstrMessageEvent, user_id: str) -> str:
+        """获取用户昵称（退群用户已不在群，改用陌生人信息接口查询）"""
+        try:
+            info = await call_onebot_action(event, "get_stranger_info", user_id=int(user_id))
+            if isinstance(info, dict):
+                return str(info.get("nickname") or info.get("name") or "").strip()
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 获取用户 {user_id} 昵称失败: {e}")
+        return ""
+
+    async def _get_user_role(self, event: AstrMessageEvent, group_id: str, user_id: str) -> str:
+        """获取用户在该群的身份中文名（群主/管理员）；查询失败返回空字符串"""
+        try:
+            info = await call_onebot_action(
+                event, "get_group_member_info",
+                group_id=int(group_id), user_id=int(user_id),
+            )
+            if isinstance(info, dict):
+                role = str(info.get("role", "")).lower()
+                if role == "owner":
+                    return "群主"
+                if role in ("admin", "administrator"):
+                    return "管理员"
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 获取用户 {user_id} 群身份失败: {e}")
+        return ""
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_group_decrease(self, event: AstrMessageEvent):
+        """
+        监听群成员退群事件（notice/group_decrease）并在群内提示：
+        - leave：成员主动退群 → 显示「xxx 已主动退群」
+        - kick：被管理员/群主移出 → 显示「xxx 已被 yyy 移出群聊」
+        - kick_me：Bot 自己被移出 → 不提示
+        受「退群提示开关」(enable_group_decrease_notice) 控制，黑名单群不生效。
+        """
+        if not self.config.get("enable_group_decrease_notice", True):
+            return
+
+        raw_msg = getattr(event.message_obj, "raw_message", {})
+        raw_dict = raw_msg if isinstance(raw_msg, dict) else {}
+        if not raw_dict:
+            return
+        if not (raw_dict.get("post_type") == "notice"
+                and raw_dict.get("notice_type") == "group_decrease"):
+            return
+
+        group_id = str(raw_dict.get("group_id", "") or "")
+        user_id = str(raw_dict.get("user_id", "") or "")
+        operator_id = str(raw_dict.get("operator_id", "") or "")
+        sub_type = raw_dict.get("sub_type", "")
+        if not group_id or not user_id:
+            return
+        # 黑名单群不处理
+        if is_blacklisted_group(self.config, group_id):
+            return
+        # Bot 自己被移出：不提示（兼容协议端 sub_type 不规范的情况，额外校验退群者是否为 Bot 自身）
+        if sub_type == "kick_me" or str(user_id) == str(event.get_self_id()):
+            return
+        # Bot 自己移除成员时不发退群提示（避免踢人操作后再补一条多余提示）
+        if sub_type == "kick" and str(operator_id) == str(event.get_self_id()):
+            logger.info(f"{LOG_PREFIX} 退群提示跳过：用户 {user_id} 被 Bot 自身移出群 {group_id}（不重复提示）")
+            return
+
+        nickname = await self._get_user_nickname(event, user_id)
+        if not nickname:
+            nickname = user_id
+
+        if sub_type == "leave":
+            msg = f"{nickname}({user_id}) 已主动退群"
+        elif sub_type == "kick":
+            # 操作者（移除群聊的人）：显示「身份+昵称」（如 群主小丽 / 管理员小明），不加 QQ 号
+            op_role = await self._get_user_role(event, group_id, operator_id) if operator_id else ""
+            op_nick = await self._get_user_nickname(event, operator_id) if operator_id else ""
+            if op_role and op_nick:
+                msg = f"{nickname}({user_id}) 已被 {op_role}{op_nick} 移出群聊"
+            elif op_nick:
+                msg = f"{nickname}({user_id}) 已被 {op_nick} 移出群聊"
+            else:
+                msg = f"{nickname}({user_id}) 已被管理员/群主移出群聊"
+        else:
+            return
+
+        try:
+            await event.send(event.chain_result([
+                Plain(f" {msg}"),
+            ]))
+            logger.info(f"{LOG_PREFIX} 退群提示已发送：用户 {user_id} 在群 {group_id}（sub_type={sub_type}）")
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 发送退群提示失败: {e}")
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_group_increase(self, event: AstrMessageEvent):
+        """
+        监听新人入群事件（notice/group_increase）：
+        人机验证关闭时，黑名单等整套人机防线都不生效；
+        开启时：黑名单用户发提示后移出群聊，其余新人触发随机加减法人机验证。
+        """
+        # 人机验证总开关：关闭则整套人机防线（含黑名单）都不生效
+        if not self.config.get("enable_join_verify", False):
+            return
+
+        raw_msg = getattr(event.message_obj, "raw_message", {})
+        raw_dict = raw_msg if isinstance(raw_msg, dict) else {}
+        if not raw_dict:
+            return
+
+        # 退群事件：清理该用户的验证状态（避免退群后快速重新入群时旧状态残留导致不发新题）
+        if (raw_dict.get("post_type") == "notice"
+                and raw_dict.get("notice_type") == "group_decrease"):
+            group_id = str(raw_dict.get("group_id", "") or "")
+            user_id = str(raw_dict.get("user_id", "") or "")
+            state = self._join_verify_state.pop((group_id, user_id), None)
+            if state:
+                if state["task"]:
+                    state["task"].cancel()
+                logger.info(f"{LOG_PREFIX} 用户 {user_id} 退群 {group_id}，已清理人机验证状态")
+            return
+
+        # 仅处理新人入群通知（notice/group_increase）
+        if not (raw_dict.get("post_type") == "notice"
+                and raw_dict.get("notice_type") == "group_increase"):
+            return
+
+        group_id = str(raw_dict.get("group_id", "") or "")
+        user_id = str(raw_dict.get("user_id", "") or "")
+        if not group_id or not user_id:
+            return
+        # 排除 Bot 自己入群
+        if str(user_id) == str(event.get_self_id()):
+            return
+        # 黑名单群不处理
+        if is_blacklisted_group(self.config, group_id):
+            return
+        # Bot 权限自检：只在 Bot 为群主或管理员的群生效（否则无法踢人，无需验证）
+        bot_role = await get_bot_role_in_group(event, group_id)
+        if bot_role and bot_role not in {"owner", "admin", "administrator"}:
+            logger.info(
+                f"{LOG_PREFIX} Bot 在群 {group_id} 中无管理权限（当前角色：{bot_role}），跳过入群人机验证与黑名单拦截。"
+            )
+            return
+        # 入群黑名单用户：先发送提示，10秒后移出群聊并拉黑（防止通过其他途径进群）
+        if self._is_join_verify_blacklisted(user_id):
+            # 发送提示
+            msg = "很抱歉，你是黑名单中的用户，你将在10秒后被移除群聊！"
+            try:
+                await event.send(event.chain_result([
+                    At(qq=user_id),
+                    Plain(f" {msg}"),
+                ]))
+                logger.info(
+                    f"{LOG_PREFIX} 黑名单用户入群提示已发送：用户 {user_id} 在群 {group_id}（10秒后移出）"
+                )
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} 发送黑名单用户入群提示失败: {e}")
+
+            # 等待 10 秒
+            await asyncio.sleep(10)
+
+            # 真正执行踢出
+            try:
+                await call_onebot_action(
+                    event,
+                    "set_group_kick",
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    reject_add_request=True
+                )
+                logger.info(
+                    f"{LOG_PREFIX} 入群黑名单用户移出群聊：用户 {user_id} 移出群 {group_id}"
+                )
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} 入群黑名单用户移出群聊失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+            return
+        # 避免重复验证
+        if (group_id, user_id) in self._join_verify_state:
+            return
+
+        # 生成随机加减法题目（结果非负）
+        a = random.randint(1, 50)
+        b = random.randint(1, 50)
+        if random.random() < 0.5:
+            answer = a + b
+            expr = f"{a} + {b}"
+        else:
+            if a < b:
+                a, b = b, a
+            answer = a - b
+            expr = f"{a} - {b}"
+
+        timeout = max(10, int(self.config.get("join_verify_timeout", 120) or 120))
+        max_attempts = max(1, int(self.config.get("join_verify_max_attempts", 3) or 3))
+
+        # @新人发送题目
+        try:
+            await event.send(event.chain_result([
+                At(qq=user_id),
+                Plain(
+                    f" 欢迎入群！请完成人机验证：\n"
+                    f"请计算 {expr} = ?\n"
+                    f"请直接回复数字答案（限 {timeout} 秒内，答错 {max_attempts} 次将被移出群聊）"
+                ),
+            ]))
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 发送人机验证题目失败: {e}")
+            return
+
+        # 记录验证状态并启动超时定时器
+        task = asyncio.create_task(
+            self._join_verify_timeout_kick(group_id, user_id, timeout)
+        )
+        self._join_verify_state[(group_id, user_id)] = {
+            "answer": answer,
+            "attempts": 0,
+            "max_attempts": max_attempts,
+            "task": task,
+            "event": event,
+            "expr": expr,
+        }
+        logger.info(
+            f"{LOG_PREFIX} 人机验证已启动：用户 {user_id} 加入群 {group_id}，题目 {expr} = ?，限时 {timeout} 秒"
+        )
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_message_join_verify(self, event: AstrMessageEvent):
+        """
+        监测待验证用户的群消息，判断其回复的答案是否正确。
+        仅在存在待验证状态时介入，不影响其他消息的正常处理。
+        """
+        if not self._join_verify_state:
+            return
+
+        # 跳过 notice/request 等系统事件（其 message_str 为空，会导致误触发「请直接回复数字答案」提示）
+        raw_msg = getattr(event.message_obj, "raw_message", None)
+        if isinstance(raw_msg, dict) and raw_msg.get("post_type") in ("notice", "request"):
+            return
+        if not event.message_str or not event.message_str.strip():
+            return
+
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+        key = (group_id, sender_id)
+        state = self._join_verify_state.get(key)
+        if state is None:
+            return
+
+        # 提取纯文本段（跳过 At/Reply 等非文本元素）：
+        # 兼容用户 @Bot 或引用消息回答时，message_str 可能含 @ 昵称/引用残留的情况
+        text_parts = []
+        msg_chain = getattr(event.message_obj, "message", None)
+        if isinstance(msg_chain, list):
+            for comp in msg_chain:
+                # 只取纯文本段（Plain 组件），跳过 At/Reply 等非文本元素
+                if isinstance(comp, Plain):
+                    t = getattr(comp, "text", "") or ""
+                    if t.strip():
+                        text_parts.append(t)
+        content = "".join(text_parts).strip() if text_parts else event.message_str.strip()
+        if not content or not content.isdigit():
+            await event.send(event.chain_result([
+                At(qq=sender_id),
+                Plain(" 请直接回复数字答案"),
+            ]))
+            # 终止事件传播：避免待验证用户 @Bot 的消息继续触发 LLM 调用
+            event.stop_event()
+            return
+
+        answer = int(content)
+        if answer == state["answer"]:
+            # 验证成功
+            self._join_verify_state.pop(key, None)
+            if state["task"]:
+                state["task"].cancel()
+            await event.send(event.chain_result([
+                At(qq=sender_id),
+                Plain(" ✅ 验证成功，欢迎加入！"),
+            ]))
+            # 终止事件传播：避免 @Bot 的验证消息继续触发 LLM 调用
+            event.stop_event()
+            logger.info(f"{LOG_PREFIX} 人机验证通过：用户 {sender_id} 在群 {group_id}")
+        else:
+            state["attempts"] += 1
+            remaining = state["max_attempts"] - state["attempts"]
+            if remaining <= 0:
+                # 错误次数达上限，踢出
+                self._join_verify_state.pop(key, None)
+                if state["task"]:
+                    state["task"].cancel()
+                await self._kick_join_verify_user(
+                    state["event"], group_id, sender_id, "人机验证答错次数超限"
+                )
+            else:
+                await event.send(event.chain_result([
+                At(qq=sender_id),
+                Plain(f" ❌ 答案错误，还剩 {remaining} 次机会"),
+            ]))
+            # 终止事件传播：避免 @Bot 的验证消息继续触发 LLM 调用
+            event.stop_event()
+
+    async def _join_verify_timeout_kick(
+        self, group_id: str, user_id: str, timeout: int
+    ):
+        """超时未通过验证则移出群聊；若剩余时间少于 1 分钟仍未答对，先 @新人 提醒并重发题目"""
+        # 若总时限大于 60 秒，在剩余 60 秒时发送提醒并重发题目
+        if timeout > 60:
+            await asyncio.sleep(timeout - 60)
+            state = self._join_verify_state.get((group_id, user_id))
+            if state is None:
+                return  # 用户已通过验证或被清理，无需提醒
+            try:
+                await state["event"].send(state["event"].chain_result([
+                    At(qq=user_id),
+                    Plain(
+                        f" ⏰ 还剩 1 分钟，请尽快完成人机验证：请计算 {state['expr']} = ?"
+                    ),
+                ]))
+                logger.info(
+                    f"{LOG_PREFIX} 人机验证剩余1分钟提醒：用户 {user_id} 在群 {group_id}，重发题目 {state['expr']} = ?"
+                )
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} 发送人机验证剩余时间提醒失败: {e}")
+            await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(timeout)
+
+        # 超时未通过验证 → 移出群聊
+        state = self._join_verify_state.pop((group_id, user_id), None)
+        if state is None:
+            return
+        await self._kick_join_verify_user(
+            state["event"], group_id, user_id, "人机验证超时未通过"
+        )
+
+    async def _kick_join_verify_user(
+        self, event: AstrMessageEvent, group_id: str, user_id: str, reason: str
+    ):
+        """将未通过人机验证的用户移出群聊：先 @用户 发送提示（10 秒后移除），再执行踢出。
+        记录一次失败次数，达到上限则自动拉入入群黑名单，并通过 OneBot API 真正拉入群聊黑名单。
+        """
+        # 记录人机验证失败次数，获取剩余机会与拉黑状态
+        info = await self._record_join_verify_failure(user_id)
+        remaining = info["remaining"]
+        blacklisted = info["blacklisted"]
+
+        # 构造提示消息
+        msg = "很抱歉，你未在规定时间或次数内完成人机验证，你将在10秒后被移除群聊"
+        if remaining >= 0:  # 已设置失败次数上限
+            if blacklisted or remaining <= 0:
+                msg = "很抱歉，你未在规定时间或次数内完成人机验证，你的入群次数已用完，你将在10秒后被移除群聊并拉入黑名单！"
+            else:
+                msg += f"，你还有 {remaining} 次申请入群机会"
+
+        # 先发送提示（@用户）
+        try:
+            await event.send(event.chain_result([
+                At(qq=user_id),
+                Plain(f" {msg}"),
+            ]))
+            logger.info(
+                f"{LOG_PREFIX} 人机验证失败提示已发送：用户 {user_id} 在群 {group_id}（{msg[:30]}...）"
+            )
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 发送人机验证失败提示失败: {e}")
+
+        # 等待 10 秒后真正执行踢出
+        await asyncio.sleep(10)
+
+        try:
+            await call_onebot_action(
+                event,
+                "set_group_kick",
+                group_id=int(group_id),
+                user_id=int(user_id),
+                # 达到上限 → reject_add_request=True，QQ 侧真正拉黑（拒绝再次申请）；否则普通踢出
+                reject_add_request=blacklisted
+            )
+            if blacklisted:
+                logger.info(
+                    f"{LOG_PREFIX} 人机验证失败移出群聊并拉黑：用户 {user_id} 移出群 {group_id}（{reason}，已拉入QQ群黑名单）"
+                )
+            else:
+                logger.info(f"{LOG_PREFIX} 人机验证失败移出群聊：用户 {user_id} 移出群 {group_id}（{reason}）")
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 人机验证移出群聊失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+
+    # ============ 入群黑名单（持久化） ============
+
+    def _load_join_verify_blacklist(self) -> dict:
+        """加载入群黑名单数据"""
+        if not self._verify_blacklist_file:
+            return {}
+        try:
+            if os.path.exists(self._verify_blacklist_file):
+                with open(self._verify_blacklist_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 加载入群黑名单失败: {e}")
+        return {}
+
+    def _save_join_verify_blacklist(self, data: dict) -> None:
+        """保存入群黑名单数据"""
+        if not self._verify_blacklist_file:
+            return
+        try:
+            with open(self._verify_blacklist_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 保存入群黑名单失败: {e}")
+
+    def _is_join_verify_blacklisted(self, user_id: str) -> bool:
+        """判断用户是否已在入群黑名单中"""
+        data = self._load_join_verify_blacklist()
+        rec = data.get(str(user_id), {})
+        return bool(rec.get("blacklisted", False))
+
+    async def _record_join_verify_failure(self, user_id: str) -> dict:
+        """记录一次人机验证失败；累计达到上限后自动拉入入群黑名单。
+
+        Returns:
+            字典：{"failures": 累计失败次数, "remaining": 剩余机会次数（-1 表示未设置次数限制）, "blacklisted": 是否已拉黑}
+        """
+        max_failures = int(self.config.get("join_verify_max_failures", 0) or 0)
+        if max_failures <= 0:
+            # 未启用次数限制：仍记录失败次数（仅统计），不自动拉黑、剩余不限；
+            # 手动拉黑的用户保持拉黑状态
+            data = self._load_join_verify_blacklist()
+            rec = data.setdefault(str(user_id), {"failures": 0, "blacklisted": False})
+            rec["failures"] = int(rec.get("failures", 0)) + 1
+            if rec.get("blacklisted"):
+                rec["remaining"] = 0
+                self._save_join_verify_blacklist(data)
+                return {"failures": rec["failures"], "remaining": 0, "blacklisted": True}
+            rec["remaining"] = -1
+            self._save_join_verify_blacklist(data)
+            return {"failures": rec["failures"], "remaining": -1, "blacklisted": False}
+
+        data = self._load_join_verify_blacklist()
+        rec = data.setdefault(
+            str(user_id),
+            {"failures": 0, "blacklisted": False, "remaining": max_failures},
+        )
+        rec["failures"] = int(rec.get("failures", 0)) + 1  # 失败次数：纯累计统计
+        # 剩余次数独立管理：新用户初始=上限；每次失败扣 1；已拉黑恒为 0
+        if rec.get("blacklisted"):
+            rec["remaining"] = 0
+        else:
+            rec["remaining"] = max(0, int(rec.get("remaining", max_failures)) - 1)
+        # 剩余机会用完 → 拉黑
+        if rec.get("blacklisted") or rec["remaining"] <= 0:
+            rec["blacklisted"] = True
+            rec["remaining"] = 0
+            logger.info(
+                f"{LOG_PREFIX} 用户 {user_id} 人机验证失败（累计 {rec['failures']} 次），剩余机会用完，已拉入入群黑名单"
+            )
+            self._save_join_verify_blacklist(data)
+            return {"failures": rec["failures"], "remaining": 0, "blacklisted": True}
+        logger.info(
+            f"{LOG_PREFIX} 用户 {user_id} 人机验证失败（累计 {rec['failures']} 次，剩余 {rec['remaining']} 次）"
+        )
+        self._save_join_verify_blacklist(data)
+        return {"failures": rec["failures"], "remaining": rec["remaining"], "blacklisted": False}
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_group_add_request(self, event: AstrMessageEvent):
+        """
+        监听加群申请事件，按配置的等级门槛与入群白词自动处理入群申请。
+        - 自动拒绝（独立功能，不受自动同意开关控制）：
+          - auto_reject_below_level 开启且申请人 QQ 等级低于门槛时，自动拒绝入群。
+          - auto_reject_whitelist_miss 开启且申请人验证信息未命中任何入群白词时，自动拒绝入群。
+        - 自动同意（受 auto_accept_group_request 开关控制）：开关开启时：
+          - 仅配置白词：验证信息命中任一白词 → 自动同意
+          - 仅配置等级门槛：等级达标 → 自动同意
+          - 白词与等级同时配置：需「白词命中 + 等级达标」双条件同时满足 → 自动同意
+          - 无任何门槛：所有申请自动同意
+        - 其余情况保持人工审核（不干预）。仅处理 add 类型申请；黑名单群不生效。
+        """
+        raw_msg = getattr(event.message_obj, "raw_message", {})
+        raw_dict = raw_msg if isinstance(raw_msg, dict) else {}
+        if not raw_dict:
+            return
+
+        # 仅处理加群申请（request/group/add）
+        if not (raw_dict.get("post_type") == "request"
+                and raw_dict.get("request_type") == "group"
+                and raw_dict.get("sub_type") == "add"):
+            return
+
+        group_id = raw_dict.get("group_id")
+        user_id = raw_dict.get("user_id")
+        flag = raw_dict.get("flag")
+        if not group_id or not user_id or not flag:
+            return
+
+        # 黑名单群不自动处理
+        if is_blacklisted_group(self.config, group_id):
+            return
+
+        # 入群黑名单用户：直接自动拒绝（仅人机验证开启时生效；关闭则整套人机防线停用）
+        if self.config.get("enable_join_verify", False) and self._is_join_verify_blacklisted(user_id):
+            try:
+                await call_onebot_action(
+                    event,
+                    "set_group_add_request",
+                    flag=str(flag),
+                    sub_type="add",
+                    approve=False,
+                    reason="您因多次未通过人机验证，已被拉入群黑名单"
+                )
+                logger.info(
+                    f"{LOG_PREFIX} 自动拒绝入群（黑名单用户）：用户 {user_id} 申请加入群 {group_id}"
+                )
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+            return
+
+        min_level = int(self.config.get("auto_accept_group_level", 0) or 0)
+        reject_enabled = self.config.get("auto_reject_below_level", False)
+        reject_whitelist_miss_enabled = self.config.get("auto_reject_whitelist_miss", False)
+        accept_enabled = self.config.get("auto_accept_group_request", False)
+        whitelist = [str(w).strip() for w in (self.config.get("auto_accept_group_whitelist") or []) if str(w).strip()]
+
+        # 读取申请人填写的验证信息
+        comment = str(raw_dict.get("comment", "") or "")
+
+        # 主动查询申请人的 QQ 等级（NapCat 加群申请事件不推送 level 字段，
+        # 需调用 get_stranger_info 查询，与本地 qqadmin 插件方式一致）
+        level = 0
+        try:
+            info = await call_onebot_action(
+                event,
+                "get_stranger_info",
+                user_id=int(user_id)
+            )
+            if isinstance(info, dict):
+                if info.get("isHideQQLevel"):
+                    level = 0  # 用户隐藏了 QQ 等级，视为未知
+                else:
+                    level = int(info.get("qqLevel") or info.get("level") or 0)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 获取申请人 {user_id} QQ等级失败: {e}")
+            level = 0
+        logger.info(
+            f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}）：申请人QQ等级={level}，验证信息='{comment}'"
+        )
+
+        level_requirement = min_level > 0
+        whitelist_requirement = len(whitelist) > 0
+        level_passed = (level >= min_level) if level_requirement else True
+        whitelist_passed = any(w in comment for w in whitelist) if whitelist_requirement else True
+
+        # 1. 未命中入群白词：自动拒绝（独立开关，不受自动同意开关控制）
+        if whitelist_requirement and reject_whitelist_miss_enabled and not whitelist_passed:
+            try:
+                await call_onebot_action(
+                    event,
+                    "set_group_add_request",
+                    flag=str(flag),
+                    sub_type="add",
+                    approve=False,
+                    reason="入群验证信息未包含指定白词"
+                )
+                logger.info(
+                    f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（验证信息未命中入群白词）"
+                )
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+            return
+
+        # 2. 等级未达门槛：自动拒绝（独立功能）或保持人工审核
+        if level_requirement and not level_passed:
+            if reject_enabled:
+                try:
+                    await call_onebot_action(
+                        event,
+                        "set_group_add_request",
+                        flag=str(flag),
+                        sub_type="add",
+                        approve=False,
+                        reason=f"QQ等级未达到入群门槛（要求不低于{min_level}级）"
+                    )
+                    logger.info(
+                        f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（QQ等级 {level} < 门槛 {min_level}）"
+                    )
+                except Exception as e:
+                    logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+            else:
+                logger.info(
+                    f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}），"
+                    f"申请人 QQ 等级 {level} 低于门槛 {min_level}，保持人工审核。"
+                )
+            return
+
+        # 3. 自动同意开关未开启 → 不干预
+        if not accept_enabled:
+            logger.info(
+                f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}），"
+                f"但自动同意入群开关未开启，保持人工审核。如需自动同意请在插件配置中开启 auto_accept_group_request。"
+            )
+            return
+
+        # 4. 存在白词门槛但验证信息未命中 → 不干预
+        if whitelist_requirement and not whitelist_passed:
+            logger.info(
+                f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}），"
+                f"申请人验证信息未包含入群白词，保持人工审核。"
+            )
+            return
+
+        # 5. 全部条件满足 → 自动同意入群
+        try:
+            await call_onebot_action(
+                event,
+                "set_group_add_request",
+                flag=str(flag),
+                sub_type="add",
+                approve=True
+            )
+            if whitelist_requirement and level_requirement:
+                logger.info(
+                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（白词命中 + QQ等级 {level} ≥ 门槛 {min_level}）"
+                )
+            elif whitelist_requirement:
+                logger.info(
+                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（验证信息命中白词）"
+                )
+            elif level_requirement:
+                logger.info(
+                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（QQ等级 {level} ≥ 门槛 {min_level}）"
+                )
+            else:
+                logger.info(
+                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（无门槛）"
+                )
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 自动同意入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+
     @llm_tool(name="at_all_members")
     async def at_all_members(
         self,
@@ -396,32 +918,14 @@ class QQGroupAdminPlugin(Star):
             return "操作失败：管理员已在插件配置中关闭了 @ 成员功能（含 @全体成员）。"
 
         # 1. 检查发送者/操作者的权限
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="at_all_members")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="at_all_members")
         if not ok:
             return err_msg
 
         # 2. 预检 Bot 账号自身在群内是否具备管理员/群主权限
-        try:
-            bot_self_id = getattr(event, "self_id", None)
-            if not bot_self_id:
-                login_info = await self._call_onebot_action(event, "get_login_info")
-                if isinstance(login_info, dict):
-                    bot_self_id = login_info.get("user_id")
-
-            if bot_self_id:
-                bot_member_info = await self._call_onebot_action(
-                    event,
-                    "get_group_member_info",
-                    group_id=int(group_id),
-                    user_id=int(bot_self_id),
-                    no_cache=True
-                )
-                if isinstance(bot_member_info, dict):
-                    bot_role = str(bot_member_info.get("role", "member")).lower()
-                    if bot_role not in {"owner", "admin"}:
-                        return f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏管理员或群主权限（当前角色为普通成员）。请先将 Bot 设为群管理员后再试。"
-        except Exception as e:
-            logger.warning(f"[QQGroupAdmin] 预检 Bot 自身 @全体 权限失败: {e}")
+        bot_role = await get_bot_role_in_group(event, group_id)
+        if bot_role and bot_role not in {"owner", "admin"}:
+            return f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏管理员或群主权限（当前角色为普通成员）。请先将 Bot 设为群管理员后再试。"
 
         return "授权成功！你与 Bot 均已具备 @全体成员 权限。请在你的最终回复开头写上 [at:all]，并附带具体的通知或提醒文本，合成在同一条消息中回复给用户。"
 
@@ -441,11 +945,11 @@ class QQGroupAdminPlugin(Star):
             duration_minutes (int): 禁言时长（单位：分钟）。如果为 0 则代表解除禁言。
             reason (str, optional): 禁言或解禁的原因或说明。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="ban_group_member")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="ban_group_member")
         if not ok:
             return err_msg
 
@@ -453,7 +957,7 @@ class QQGroupAdminPlugin(Star):
         action_name = "禁言" if duration_seconds > 0 else "解除禁言"
 
         try:
-            res = await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_ban",
                 group_id=int(group_id),
@@ -467,7 +971,7 @@ class QQGroupAdminPlugin(Star):
                 return f"成功：以 [{auth_role}] 身份为成员 ({cleaned_target}) 解除了禁言{reason_info}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 {action_name} 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 {action_name} 失败: {err_str}")
             if "permission" in err_str.lower() or "100" in err_str or "403" in err_str:
                 return f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏管理员权限，或目标成员角色（如群主/管理员）高于 Bot 账号。"
             return f"执行 {action_name} 失败，API 错误：{err_str}"
@@ -488,16 +992,16 @@ class QQGroupAdminPlugin(Star):
             reject_add_request (bool, optional): 是否同时拒绝该用户后续的加群申请（拉黑/黑名单）。默认 False。
             reason (str, optional): 移除群聊的原因或说明。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="kick_group_member")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="kick_group_member")
         if not ok:
             return err_msg
 
         try:
-            res = await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_kick",
                 group_id=int(group_id),
@@ -509,7 +1013,29 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份已将成员 ({cleaned_target}) 移除群聊{block_info}{reason_info}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行踢人失败: {err_str}")
+            retcode = getattr(e, "retcode", None)
+            result = getattr(e, "result", None) or {}
+            err_msg = result.get("message", "") if isinstance(result, dict) else ""
+            logger.error(f"{LOG_PREFIX} 执行踢人失败: retcode={retcode}, message={err_msg}, {err_str}")
+            # 降级判断：NapCat 对 set_group_kick 的 reject_add_request 附带操作实现不完整，
+            # 常出现「踢人已生效但整体返回 retcode=100」的情况。
+            # 若确认踢人已生效，降级返回「踢人成功但附加操作可能未完全成功」，不再误报整体失败。
+            lowered = False
+            if retcode == 100:
+                if reject_add_request:
+                    # 拉黑踢人场景：NapCat 已知问题，踢出通常已生效
+                    lowered = True
+                elif any(kw in err_msg for kw in ("移出", "移除", "踢出", "已移出", "已移除", "success", "成功")):
+                    # 普通踢人：报错信息含「已移出」等特征，说明踢人已生效
+                    lowered = True
+            if lowered:
+                block_info = "（已同步拒绝后续加群申请）" if reject_add_request else ""
+                reason_info = f"，原因：{reason}" if reason else ""
+                return (
+                    f"成功：以 [{auth_role}] 身份已将成员 ({cleaned_target}) 移除群聊{block_info}{reason_info}。"
+                    f"（注意：NapCat 返回 retcode={retcode}，踢人已生效，但附加操作可能未完全成功，"
+                    f"详情请查看 NapCat 日志）"
+                )
             return f"执行踢人失败，API 错误：{err_str}"
 
     @llm_tool(name="delete_group_message")
@@ -524,7 +1050,7 @@ class QQGroupAdminPlugin(Star):
         Args:
             message_id (str, optional): 需撤回的消息 ID（单条或以逗号/空格分隔的多条 ID）。若为空则优先提取当前回复引用的消息 ID。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="delete_group_message")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="delete_group_message")
         if not ok:
             return err_msg
 
@@ -533,18 +1059,14 @@ class QQGroupAdminPlugin(Star):
         if message_id.strip():
             raw_tokens = re.split(r"[,;\s]+", message_id.strip())
             for tok in raw_tokens:
-                cleaned = re.sub(r"\D", "", tok)
+                cleaned = clean_qq_number(tok)
                 if cleaned:
                     target_ids.append(int(cleaned))
 
-        if not target_ids and hasattr(event, "message_obj"):
-            reply = getattr(event.message_obj, "reply", None)
-            if reply:
-                reply_id = getattr(reply, "id", None) or getattr(reply, "message_id", None)
-                if reply_id:
-                    cleaned_reply = re.sub(r"\D", "", str(reply_id))
-                    if cleaned_reply:
-                        target_ids.append(int(cleaned_reply))
+        if not target_ids:
+            reply_id = extract_reply_message_id(event)
+            if reply_id:
+                target_ids.append(int(reply_id))
 
         if not target_ids:
             return "操作失败：未提供要撤回的 message_id，且当前消息未回复/引用任何特定消息。"
@@ -557,7 +1079,7 @@ class QQGroupAdminPlugin(Star):
 
         for mid in target_ids:
             try:
-                await self._call_onebot_action(
+                await call_onebot_action(
                     event,
                     "delete_msg",
                     message_id=int(mid)
@@ -590,20 +1112,14 @@ class QQGroupAdminPlugin(Star):
             message_id (str, optional): 目标消息 ID。若为空则自动识别当前回复引用的消息 ID。
             enable (bool, optional): 是否设为精华。True 代表设为精华，False 代表移除精华。默认 True。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="set_group_essence_message")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_essence_message")
         if not ok:
             return err_msg
 
-        target_id = ""
-        if message_id.strip():
-            target_id = re.sub(r"\D", "", message_id)
+        target_id = clean_qq_number(message_id) if message_id.strip() else ""
 
-        if not target_id and hasattr(event, "message_obj"):
-            reply = getattr(event.message_obj, "reply", None)
-            if reply:
-                reply_id = getattr(reply, "id", None) or getattr(reply, "message_id", None)
-                if reply_id:
-                    target_id = re.sub(r"\D", "", str(reply_id))
+        if not target_id:
+            target_id = extract_reply_message_id(event)
 
         if not target_id:
             return "操作失败：未指定 message_id，且当前消息未回复/引用任何目标消息。"
@@ -612,7 +1128,7 @@ class QQGroupAdminPlugin(Star):
         api_action = "set_essence_msg" if enable else "delete_essence_msg"
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 api_action,
                 message_id=int(target_id)
@@ -620,7 +1136,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份成功将消息 (ID: {target_id}) {action_name}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 {action_name} 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 {action_name} 失败: {err_str}")
             return f"执行 {action_name} 失败，API 错误：{err_str}"
 
     @llm_tool(name="get_group_msg_history")
@@ -637,7 +1153,7 @@ class QQGroupAdminPlugin(Star):
             message_seq (str, optional): 起始消息序号/ID。若为空则调取最新发送的历史消息。
             count (int, optional): 获取条数，范围 1~100。默认 20 条。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="get_group_msg_history")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_msg_history")
         if not ok:
             return err_msg
 
@@ -649,43 +1165,22 @@ class QQGroupAdminPlugin(Star):
                 "count": count
             }
             if message_seq.strip():
-                cleaned_seq = re.sub(r"\D", "", message_seq)
+                cleaned_seq = clean_qq_number(message_seq)
                 if cleaned_seq:
                     kwargs["message_seq"] = int(cleaned_seq)
 
-            res = await self._call_onebot_action(event, "get_group_msg_history", **kwargs)
-            
-            messages = []
-            if isinstance(res, dict) and "messages" in res:
-                messages = res["messages"]
-            elif isinstance(res, list):
-                messages = res
+            res = await call_onebot_action(event, "get_group_msg_history", **kwargs)
 
-            if not messages:
+            formatted = format_group_msg_history(res)
+            if not formatted:
                 return f"未获取到群 ({group_id}) 的历史消息记录。"
 
-            formatted_lines = []
-            import datetime
-            for m in messages:
-                if not isinstance(m, dict):
-                    continue
-                mid = m.get("message_id") or m.get("id") or "未知ID"
-                sender = m.get("sender", {})
-                sender_name = sender.get("card") or sender.get("nickname") or sender.get("user_id") or "未知发送者"
-                time_ts = m.get("time", 0)
-                time_str = datetime.datetime.fromtimestamp(time_ts).strftime("%H:%M:%S") if time_ts else ""
-                
-                raw_content = m.get("raw_message") or m.get("message") or ""
-                if isinstance(raw_content, list):
-                    raw_content = "".join([str(item.get("data", {}).get("text", "")) for item in raw_content if isinstance(item, dict)])
-                
-                formatted_lines.append(f"• [{time_str}] [ID: {mid}] {sender_name}: {raw_content[:80]}")
-
-            return f"获取群 ({group_id}) 最近 {len(formatted_lines)} 条历史消息成功：\n" + "\n".join(formatted_lines)
+            line_count = formatted.count("\n") + 1
+            return f"获取群 ({group_id}) 最近 {line_count} 条历史消息成功：\n{formatted}"
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 get_group_msg_history 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 get_group_msg_history 失败: {err_str}")
             return f"获取群历史消息 API 出错：{err_str}"
 
     @llm_tool(name="set_group_whole_ban")
@@ -700,14 +1195,14 @@ class QQGroupAdminPlugin(Star):
         Args:
             enable (bool, optional): 是否开启全员禁言。True 代表开启全员禁言，False 代表解除全员禁言。默认 True。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="set_group_whole_ban")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_whole_ban")
         if not ok:
             return err_msg
 
         action_name = "开启全员禁言" if enable else "解除全员禁言"
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_whole_ban",
                 group_id=int(group_id),
@@ -716,7 +1211,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份成功为群 ({group_id}) {action_name}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 {action_name} 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 {action_name} 失败: {err_str}")
             return f"执行 {action_name} 失败，API 错误：{err_str}"
 
     @llm_tool(name="set_group_card")
@@ -733,18 +1228,18 @@ class QQGroupAdminPlugin(Star):
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
             card (str, optional): 新的群名片文本。若为空则代表清空/重置名片。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="set_group_card")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_card")
         if not ok:
             return err_msg
 
         action_desc = f"修改群名片为 '{card}'" if card else "清空群名片"
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_card",
                 group_id=int(group_id),
@@ -754,7 +1249,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份成功为成员 ({cleaned_target}) {action_desc}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 修改群名片失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 修改群名片失败: {err_str}")
             return f"修改群名片失败，API 错误：{err_str}"
 
     @llm_tool(name="set_group_special_title")
@@ -773,18 +1268,18 @@ class QQGroupAdminPlugin(Star):
             special_title (str, optional): 专属头衔文本。若为空则代表撤销头衔。
             duration_days (int, optional): 头衔有效期（单位：天）。如果为 -1 代表永久有效。默认 -1。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="set_group_special_title")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_special_title")
         if not ok:
             return err_msg
 
         duration_seconds = -1 if duration_days <= 0 else duration_days * 86400
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_special_title",
                 group_id=int(group_id),
@@ -796,7 +1291,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份为成员 ({cleaned_target}) {title_desc}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 设置专属头衔失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 设置专属头衔失败: {err_str}")
             return f"设置专属头衔失败（要求 Bot 账号自身具备群主身份），API 错误：{err_str}"
 
     @llm_tool(name="set_group_admin")
@@ -813,18 +1308,18 @@ class QQGroupAdminPlugin(Star):
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
             enable (bool, optional): 是否设置为管理员。True 代表设置为管理员，False 代表取消管理员。默认 True。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="set_group_admin")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_admin")
         if not ok:
             return err_msg
 
         action_name = "设置群管理员" if enable else "取消群管理员"
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_admin",
                 group_id=int(group_id),
@@ -834,7 +1329,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份为成员 ({cleaned_target}) {action_name}。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 {action_name} 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 {action_name} 失败: {err_str}")
             return f"执行 {action_name} 失败（要求 Bot 账号自身具备群主身份），API 错误：{err_str}"
 
     @llm_tool(name="set_group_name")
@@ -852,12 +1347,12 @@ class QQGroupAdminPlugin(Star):
         if not group_name.strip():
             return "操作失败：新的群名称不能为空。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="set_group_name")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_name")
         if not ok:
             return err_msg
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "set_group_name",
                 group_id=int(group_id),
@@ -866,7 +1361,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份将群聊名称修改为 '{group_name.strip()}'。"
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 修改群名称失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 修改群名称失败: {err_str}")
             return f"修改群名称失败，API 错误：{err_str}"
 
     @llm_tool(name="send_group_notice")
@@ -890,7 +1385,7 @@ class QQGroupAdminPlugin(Star):
             content (str): 发布公告时的公告文案内容（仅 action="publish" 时需要）。
             notice_id (str): 删除公告时的公告 ID（仅 action="delete" 时需要）。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="send_group_notice")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="send_group_notice")
         if not ok:
             return err_msg
 
@@ -898,33 +1393,15 @@ class QQGroupAdminPlugin(Star):
 
         # 检查 Bot 自身是否具备群管理员/群主身份（发布与删除公告需要权限）
         if action in {"publish", "delete"}:
-            try:
-                bot_self_id = getattr(event, "self_id", None)
-                if not bot_self_id:
-                    login_info = await self._call_onebot_action(event, "get_login_info")
-                    if isinstance(login_info, dict):
-                        bot_self_id = login_info.get("user_id")
-
-                if bot_self_id:
-                    bot_member_info = await self._call_onebot_action(
-                        event,
-                        "get_group_member_info",
-                        group_id=int(group_id),
-                        user_id=int(bot_self_id),
-                        no_cache=True
-                    )
-                    if isinstance(bot_member_info, dict):
-                        bot_role = str(bot_member_info.get("role", "member")).lower()
-                        if bot_role not in {"owner", "admin"}:
-                            action_cn = "发布" if action == "publish" else "删除"
-                            return f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏管理员或群主权限（当前角色为普通成员）。{action_cn}群公告要求 Bot 账号必须具备群管理员或群主身份。"
-            except Exception as e:
-                logger.warning(f"[QQGroupAdmin] 预检 Bot 账号群权限失败: {e}")
+            bot_role = await get_bot_role_in_group(event, group_id)
+            if bot_role and bot_role not in {"owner", "admin"}:
+                action_cn = "发布" if action == "publish" else "删除"
+                return f"操作失败：Bot 账号自身在群 ({group_id}) 内缺乏管理员或群主权限（当前角色为普通成员）。{action_cn}群公告要求 Bot 账号必须具备群管理员或群主身份。"
 
         # 读取群公告
         if action == "get":
             try:
-                res = await self._call_onebot_action(
+                res = await call_onebot_action(
                     event,
                     "_get_group_notice",
                     group_id=int(group_id)
@@ -932,7 +1409,7 @@ class QQGroupAdminPlugin(Star):
                 return f"成功：以 [{auth_role}] 身份查询到群 ({group_id}) 的公告列表：\n{res}"
             except Exception as e:
                 err_str = str(e)
-                logger.error(f"[QQGroupAdmin] 读取群公告失败: {err_str}")
+                logger.error(f"{LOG_PREFIX} 读取群公告失败: {err_str}")
                 return f"读取群公告失败，API 错误：{err_str}"
 
         # 删除群公告
@@ -940,7 +1417,7 @@ class QQGroupAdminPlugin(Star):
             if not notice_id.strip():
                 return "操作失败：删除群公告需要提供要删除的公告 ID（notice_id）。"
             try:
-                await self._call_onebot_action(
+                await call_onebot_action(
                     event,
                     "_del_group_notice",
                     group_id=int(group_id),
@@ -949,7 +1426,7 @@ class QQGroupAdminPlugin(Star):
                 return f"成功：以 [{auth_role}] 身份删除了群 ({group_id}) 中 ID 为 '{notice_id.strip()}' 的群公告。"
             except Exception as e:
                 err_str = str(e)
-                logger.error(f"[QQGroupAdmin] 删除群公告失败: {err_str}")
+                logger.error(f"{LOG_PREFIX} 删除群公告失败: {err_str}")
                 return f"删除群公告失败，API 错误：{err_str}"
 
         # 默认：发布群公告
@@ -957,7 +1434,7 @@ class QQGroupAdminPlugin(Star):
             return "操作失败：群公告文案内容不能为空。"
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "_send_group_notice",
                 group_id=int(group_id),
@@ -966,7 +1443,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份在群 ({group_id}) 中发布了全新群公告。"
         except Exception:
             try:
-                await self._call_onebot_action(
+                await call_onebot_action(
                     event,
                     "send_group_notice",
                     group_id=int(group_id),
@@ -975,7 +1452,7 @@ class QQGroupAdminPlugin(Star):
                 return f"成功：以 [{auth_role}] 身份在群 ({group_id}) 中发布了全新群公告。"
             except Exception as e2:
                 err_str = str(e2)
-                logger.error(f"[QQGroupAdmin] 发布群公告失败: {err_str}")
+                logger.error(f"{LOG_PREFIX} 发布群公告失败: {err_str}")
                 return f"发布群公告失败，API 错误：{err_str}"
 
     @llm_tool(name="get_group_info")
@@ -986,12 +1463,12 @@ class QQGroupAdminPlugin(Star):
         """
         在 QQ 群聊中获取当前群聊的详细信息（群名称、群主 QQ、成员数、最大容量等）。当需要了解群基础信息时调用（工具内部会自动校验调用者权限）。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="get_group_info")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_info")
         if not ok:
             return err_msg
 
         try:
-            res = await self._call_onebot_action(
+            res = await call_onebot_action(
                 event,
                 "get_group_info",
                 group_id=int(group_id),
@@ -1014,7 +1491,7 @@ class QQGroupAdminPlugin(Star):
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 get_group_info 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 get_group_info 失败: {err_str}")
             return f"获取群信息 API 出错：{err_str}"
 
     @llm_tool(name="get_group_member_list")
@@ -1037,12 +1514,12 @@ class QQGroupAdminPlugin(Star):
             sort_by_group_level (bool, optional): 是否按群等级排序。当用户询问“群等级最高/最低的人”、“按群等级排序”时设置为 True。默认 False。
             sort_oldest_first (bool, optional): 是否升序排序（从旧到新 / 从低到高）。当用户询问“最久没发言”、“最低群等级”、“最早进群”、“从小到大/升序”时设置为 True。默认 False（即默认降序：最新/最高）。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="get_group_member_list")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_member_list")
         if not ok:
             return err_msg
 
         try:
-            res = await self._call_onebot_action(
+            res = await call_onebot_action(
                 event,
                 "get_group_member_list",
                 group_id=int(group_id),
@@ -1051,51 +1528,19 @@ class QQGroupAdminPlugin(Star):
             if not isinstance(res, list):
                 return f"获取群 ({group_id}) 成员列表数据失败。"
 
-            # 排序逻辑：优先响应发言时间排序，其次群等级排序，最后响应进群时间排序
-            reverse_order = not sort_oldest_first
-            if sort_by_last_sent_time:
-                res = sorted(res, key=lambda x: x.get("last_sent_time", 0), reverse=reverse_order)
-            elif sort_by_group_level:
-                res = sorted(res, key=lambda x: int(x.get("level", 0)), reverse=reverse_order)
-            elif sort_by_join_time:
-                res = sorted(res, key=lambda x: x.get("join_time", 0), reverse=reverse_order)
-
-            matched = []
-            clean_kw = keyword.strip().lower()
-
-            import datetime
-            for m in res:
-                if not isinstance(m, dict):
-                    continue
-                user_id = str(m.get("user_id", ""))
-                nickname = str(m.get("nickname", ""))
-                card = str(m.get("card", ""))
-                role = str(m.get("role", "member"))
-                role_cn = "群主" if role == "owner" else ("管理员" if role == "admin" else "成员")
-                
-                last_sent_ts = m.get("last_sent_time", 0)
-                join_time_ts = m.get("join_time", 0)
-                
-                last_sent_str = datetime.datetime.fromtimestamp(last_sent_ts).strftime("%m-%d %H:%M") if last_sent_ts else "从未发言"
-                join_time_str = datetime.datetime.fromtimestamp(join_time_ts).strftime("%Y-%m-%d %H:%M") if join_time_ts else "未知"
-
-                display_name = card if card else nickname
-                level = m.get("level", 0)
-                item_str = f"• {display_name} ({user_id}) [{role_cn}] LV.{level} - 最近发言: {last_sent_str} | 入群: {join_time_str}"
-
-                if clean_kw:
-                    if clean_kw in user_id.lower() or clean_kw in card.lower() or clean_kw in nickname.lower() or clean_kw in role_cn.lower() or clean_kw in role.lower():
-                        matched.append(item_str)
-                else:
-                    matched.append(item_str)
-
-            total_found = len(matched)
-            if not matched:
+            formatted, total_found = format_member_list(
+                res,
+                keyword=keyword,
+                sort_by_join_time=sort_by_join_time,
+                sort_by_last_sent_time=sort_by_last_sent_time,
+                sort_by_group_level=sort_by_group_level,
+                sort_oldest_first=sort_oldest_first
+            )
+            if not formatted:
                 return f"在群 ({group_id}) 中未找到匹配 '{keyword}' 的群成员。"
 
-            display_list = matched[:30]
             suffix = f"\n... 等共 {total_found} 人" if total_found > 30 else ""
-            
+
             desc_parts = []
             order_text = "从最旧到最新" if sort_oldest_first else "从最新到最旧"
             level_order_text = "从低到高" if sort_oldest_first else "从高到低"
@@ -1110,14 +1555,14 @@ class QQGroupAdminPlugin(Star):
                 desc_parts.append(f"关键词：'{keyword}'")
             else:
                 desc_parts.append("展示前30人")
-            
+
             kw_desc = f"（{', '.join(desc_parts)}）"
 
-            return f"群 ({group_id}) 成员列表{kw_desc}：\n" + "\n".join(display_list) + suffix
+            return f"群 ({group_id}) 成员列表{kw_desc}：\n" + formatted + suffix
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 get_group_member_list 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 get_group_member_list 失败: {err_str}")
             return f"获取群成员列表 API 出错：{err_str}"
 
     @llm_tool(name="group_poke")
@@ -1132,16 +1577,16 @@ class QQGroupAdminPlugin(Star):
         Args:
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="group_poke")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="group_poke")
         if not ok:
             return err_msg
 
         try:
-            await self._call_onebot_action(
+            await call_onebot_action(
                 event,
                 "group_poke",
                 group_id=int(group_id),
@@ -1150,7 +1595,7 @@ class QQGroupAdminPlugin(Star):
             return f"成功：以 [{auth_role}] 身份对成员 ({cleaned_target}) 执行了“戳一戳”操作。"
         except Exception:
             try:
-                await self._call_onebot_action(
+                await call_onebot_action(
                     event,
                     "friend_poke",
                     user_id=int(cleaned_target)
@@ -1158,7 +1603,7 @@ class QQGroupAdminPlugin(Star):
                 return f"成功：以 [{auth_role}] 身份对成员 ({cleaned_target}) 执行了“戳一戳”操作。"
             except Exception as e2:
                 err_str = str(e2)
-                logger.error(f"[QQGroupAdmin] 执行 group_poke 失败: {err_str}")
+                logger.error(f"{LOG_PREFIX} 执行 group_poke 失败: {err_str}")
                 return f"执行戳一戳失败，API 错误：{err_str}"
 
     @llm_tool(name="get_group_member_info")
@@ -1173,16 +1618,16 @@ class QQGroupAdminPlugin(Star):
         Args:
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
         """
-        cleaned_target = re.sub(r"\D", "", str(target_user))
+        cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="get_group_member_info")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_member_info")
         if not ok:
             return err_msg
 
         try:
-            res = await self._call_onebot_action(
+            res = await call_onebot_action(
                 event,
                 "get_group_member_info",
                 group_id=int(group_id),
@@ -1195,21 +1640,16 @@ class QQGroupAdminPlugin(Star):
                 role = res.get("role", "member")
                 role_cn = "群主" if role == "owner" else ("管理员" if role == "admin" else "普通成员")
                 title = res.get("title", "无头衔")
-                join_ts = res.get("join_time", 0)
-                last_sent_ts = res.get("last_sent_time", 0)
+                level = res.get("level", 0)
                 shut_up_ts = res.get("shut_up_timestamp", 0)
 
-                import datetime
-                import time
+                join_time_str = format_timestamp(res.get("join_time", 0), "%Y-%m-%d %H:%M:%S") or "未知"
+                last_sent_str = format_timestamp(res.get("last_sent_time", 0), "%Y-%m-%d %H:%M:%S") or "从未发言"
 
-                join_time_str = datetime.datetime.fromtimestamp(join_ts).strftime("%Y-%m-%d %H:%M:%S") if join_ts else "未知"
-                last_sent_str = datetime.datetime.fromtimestamp(last_sent_ts).strftime("%Y-%m-%d %H:%M:%S") if last_sent_ts else "从未发言"
-                
                 ban_until_str = "未禁言"
                 if shut_up_ts and shut_up_ts > time.time():
-                    ban_until_str = datetime.datetime.fromtimestamp(shut_up_ts).strftime("%Y-%m-%d %H:%M:%S")
+                    ban_until_str = format_timestamp(shut_up_ts, "%Y-%m-%d %H:%M:%S")
 
-                level = res.get("level", 0)
                 info_lines = [
                     f"用户 ({cleaned_target}) 详细群资料：",
                     f"• 昵称/名片：{card or nickname} ({nickname})",
@@ -1226,7 +1666,7 @@ class QQGroupAdminPlugin(Star):
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 get_group_member_info 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 get_group_member_info 失败: {err_str}")
             return f"获取群成员详细信息 API 出错：{err_str}"
 
     @llm_tool(name="kick_inactive_members")
@@ -1248,18 +1688,14 @@ class QQGroupAdminPlugin(Star):
             max_group_level (int, optional): 群等级上限门槛（如设为 10 代表仅清理群等级低于 LV.10 的成员）。0 代表不限制群等级。默认 0。
             confirm (bool, optional): 是否确认执行真正的清理踢人操作。默认 False（仅查询预览）。
         """
-        ok, auth_role, group_id, err_msg = await self._check_permission(event, tool_name="kick_inactive_members")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="kick_inactive_members")
         if not ok:
             return err_msg
 
         days = max(1, days)
-        threshold_seconds = days * 86400
-        import time
-        import datetime
-        now_ts = time.time()
 
         try:
-            members = await self._call_onebot_action(
+            members = await call_onebot_action(
                 event,
                 "get_group_member_list",
                 group_id=int(group_id),
@@ -1268,32 +1704,7 @@ class QQGroupAdminPlugin(Star):
             if not isinstance(members, list):
                 return "操作失败：无法获取群成员列表数据。"
 
-            inactive_members = []
-            for m in members:
-                if not isinstance(m, dict):
-                    continue
-                user_id = str(m.get("user_id", ""))
-                role = m.get("role", "member")
-                if role in ["owner", "admin"]:
-                    continue
-
-                level = int(m.get("level", 0))
-                if max_group_level > 0 and level >= max_group_level:
-                    continue
-
-                last_sent_ts = m.get("last_sent_time", 0)
-                join_time_ts = m.get("join_time", 0)
-
-                time_to_check = last_sent_ts if last_sent_ts > 0 else join_time_ts
-                if time_to_check > 0 and (now_ts - time_to_check >= threshold_seconds):
-                    card = m.get("card") or m.get("nickname") or user_id
-                    last_str = datetime.datetime.fromtimestamp(last_sent_ts).strftime("%Y-%m-%d") if last_sent_ts else "从未发言"
-                    inactive_members.append({
-                        "user_id": user_id,
-                        "name": card,
-                        "level": level,
-                        "last_sent_str": last_str
-                    })
+            inactive_members = scan_inactive_members(members, days, max_group_level)
 
             level_filter_desc = f" 且群等级低于 LV.{max_group_level}" if max_group_level > 0 else ""
             if not inactive_members:
@@ -1324,7 +1735,7 @@ class QQGroupAdminPlugin(Star):
 
             for item in inactive_members:
                 try:
-                    await self._call_onebot_action(
+                    await call_onebot_action(
                         event,
                         "set_group_kick",
                         group_id=int(group_id),
@@ -1334,11 +1745,11 @@ class QQGroupAdminPlugin(Star):
                     success_cnt += 1
                 except Exception as e:
                     fail_cnt += 1
-                    logger.error(f"[QQGroupAdmin] 清理潜水成员 {item['user_id']} 失败: {e}")
+                    logger.error(f"{LOG_PREFIX} 清理潜水成员 {item['user_id']} 失败: {e}")
 
             return f"成功：以 [{auth_role}] 身份执行潜水成员清理完成！成功移出 {success_cnt} 人，失败 {fail_cnt} 人。"
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[QQGroupAdmin] 执行 kick_inactive_members 失败: {err_str}")
+            logger.error(f"{LOG_PREFIX} 执行 kick_inactive_members 失败: {err_str}")
             return f"清理潜水成员 API 出错：{err_str}"
