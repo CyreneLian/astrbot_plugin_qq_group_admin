@@ -270,6 +270,8 @@ def format_member_list(
     Returns:
         (格式化文本, 匹配总数) 二元组；无匹配时文本为空字符串。
     """
+    # 先过滤非字典脏数据，避免排序/取值时崩溃
+    res = [m for m in res if isinstance(m, dict)]
     reverse_order = not sort_oldest_first
     if sort_by_last_sent_time:
         res = sorted(res, key=lambda x: x.get("last_sent_time", 0), reverse=reverse_order)
@@ -313,6 +315,35 @@ def format_member_list(
             matched.append(item_str)
 
     return "\n".join(matched[:30]), len(matched)
+
+def summarize_group_level(res: list) -> Tuple[str, int]:
+    """
+    统计群成员群等级（level）人数分布，遍历全部成员，不受 30 人展示截断影响。
+
+    Args:
+        res: get_group_member_list 的原始返回列表。
+
+    Returns:
+        (格式化统计文本, 成员总数)；无有效成员时文本为空字符串。
+    """
+    level_counter: dict[int, int] = {}
+    total = 0
+    for m in res:
+        if not isinstance(m, dict):
+            continue
+        try:
+            lv = int(m.get("level", 0))
+        except (ValueError, TypeError):
+            lv = 0
+        level_counter[lv] = level_counter.get(lv, 0) + 1
+        total += 1
+    if not level_counter:
+        return "", 0
+    lines = []
+    for lv in sorted(level_counter.keys(), reverse=True):
+        lines.append(f"LV.{lv}: {level_counter[lv]}人")
+    return "\n".join(lines), total
+
 
 
 def scan_inactive_members(

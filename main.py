@@ -42,6 +42,7 @@ from .utils import (
     get_bot_role_in_group,
     is_blacklisted_group,
     scan_inactive_members,
+    summarize_group_level,
 )
 
 logger = logging.getLogger("astrbot")
@@ -51,7 +52,7 @@ logger = logging.getLogger("astrbot")
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
     "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。",
-    "3.0.0",
+    "3.0.1",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
 class QQGroupAdminPlugin(Star):
@@ -274,8 +275,13 @@ class QQGroupAdminPlugin(Star):
             logger.error(f"{LOG_PREFIX} 获取用户 {user_id} 昵称失败: {e}")
         return ""
 
-    async def _get_user_role(self, event: AstrMessageEvent, group_id: str, user_id: str) -> str:
-        """获取用户在该群的身份中文名（群主/管理员）；查询失败返回空字符串"""
+    async def _get_operator_info(self, event: AstrMessageEvent, group_id: str, user_id: str) -> tuple[str, str]:
+        """获取操作者群信息：返回 (身份中文名, 显示名)。
+
+        身份：群主/管理员（无则空字符串）；
+        显示名：优先群名片（card/群昵称），无群名片则回退 QQ 昵称（nickname）。
+        查询失败返回 ("", "")。
+        """
         try:
             info = await call_onebot_action(
                 event, "get_group_member_info",
@@ -283,13 +289,17 @@ class QQGroupAdminPlugin(Star):
             )
             if isinstance(info, dict):
                 role = str(info.get("role", "")).lower()
+                role_cn = ""
                 if role == "owner":
-                    return "群主"
-                if role in ("admin", "administrator"):
-                    return "管理员"
+                    role_cn = "群主"
+                elif role in ("admin", "administrator"):
+                    role_cn = "管理员"
+                card = str(info.get("card") or "").strip()
+                display = card or str(info.get("nickname") or "").strip()
+                return role_cn, display
         except Exception as e:
-            logger.error(f"{LOG_PREFIX} 获取用户 {user_id} 群身份失败: {e}")
-        return ""
+            logger.error(f"{LOG_PREFIX} 获取操作者 {user_id} 群信息失败: {e}")
+        return "", ""
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -336,9 +346,11 @@ class QQGroupAdminPlugin(Star):
         if sub_type == "leave":
             msg = f"{nickname}({user_id}) 已主动退群"
         elif sub_type == "kick":
-            # 操作者（移除群聊的人）：显示「身份+昵称」（如 群主小丽 / 管理员小明），不加 QQ 号
-            op_role = await self._get_user_role(event, group_id, operator_id) if operator_id else ""
-            op_nick = await self._get_user_nickname(event, operator_id) if operator_id else ""
+            # 操作者（移除群聊的人）：显示「身份+群昵称/QQ昵称」（如 群主小丽 / 管理员小明），不加 QQ 号
+            op_role = ""
+            op_nick = ""
+            if operator_id:
+                op_role, op_nick = await self._get_operator_info(event, group_id, operator_id)
             if op_role and op_nick:
                 msg = f"{nickname}({user_id}) 已被 {op_role}{op_nick} 移出群聊"
             elif op_nick:
@@ -364,8 +376,10 @@ class QQGroupAdminPlugin(Star):
         人机验证关闭时，黑名单等整套人机防线都不生效；
         开启时：黑名单用户发提示后移出群聊，其余新人触发随机加减法人机验证。
         """
-        # 人机验证总开关：关闭则整套人机防线（含黑名单）都不生效
+        # 人机验证总开关：关闭则整套人机防线（含黑名单）都不生效，
+        # 同时取消所有进行中的人机验证任务（防止残留任务继续答题/超时踢人）
         if not self.config.get("enable_join_verify", False):
+            self._cancel_all_join_verify()
             return
 
         raw_msg = getattr(event.message_obj, "raw_message", {})
@@ -456,8 +470,15 @@ class QQGroupAdminPlugin(Star):
             answer = a - b
             expr = f"{a} - {b}"
 
-        timeout = max(10, int(self.config.get("join_verify_timeout", 120) or 120))
-        max_attempts = max(1, int(self.config.get("join_verify_max_attempts", 3) or 3))
+        # 安全读取超时与错误次数配置（防御非法配置值，异常时使用默认值，与配置面板默认对齐）
+        try:
+            timeout = max(10, int(self.config.get("join_verify_timeout", 180) or 180))
+        except (ValueError, TypeError):
+            timeout = 180
+        try:
+            max_attempts = max(1, int(self.config.get("join_verify_max_attempts", 3) or 3))
+        except (ValueError, TypeError):
+            max_attempts = 3
 
         # @新人发送题目
         try:
@@ -496,6 +517,11 @@ class QQGroupAdminPlugin(Star):
         监测待验证用户的群消息，判断其回复的答案是否正确。
         仅在存在待验证状态时介入，不影响其他消息的正常处理。
         """
+        # 人机验证总开关关闭：取消所有进行中的验证任务并停止处理（防止残留任务继续答题/踢人）
+        if not self.config.get("enable_join_verify", False):
+            self._cancel_all_join_verify()
+            return
+
         if not self._join_verify_state:
             return
 
@@ -569,10 +595,16 @@ class QQGroupAdminPlugin(Star):
     async def _join_verify_timeout_kick(
         self, group_id: str, user_id: str, timeout: int
     ):
-        """超时未通过验证则移出群聊；若剩余时间少于 1 分钟仍未答对，先 @新人 提醒并重发题目"""
+        """超时未通过验证则移出群聊；若剩余时间少于 1 分钟仍未答对，先 @新人 提醒并重发题目。
+
+        每次唤醒先检查人机验证总开关：开关已关闭则静默取消本次验证（不提醒、不踢人）。
+        """
         # 若总时限大于 60 秒，在剩余 60 秒时发送提醒并重发题目
         if timeout > 60:
             await asyncio.sleep(timeout - 60)
+            if not self.config.get("enable_join_verify", False):
+                self._join_verify_state.pop((group_id, user_id), None)
+                return  # 开关已关闭：静默取消，不提醒
             state = self._join_verify_state.get((group_id, user_id))
             if state is None:
                 return  # 用户已通过验证或被清理，无需提醒
@@ -592,13 +624,40 @@ class QQGroupAdminPlugin(Star):
         else:
             await asyncio.sleep(timeout)
 
-        # 超时未通过验证 → 移出群聊
+        # 超时未通过验证 → 移出群聊（踢人前再检查一次开关，关闭则静默取消，杜绝幽灵踢人）
+        if not self.config.get("enable_join_verify", False):
+            self._join_verify_state.pop((group_id, user_id), None)
+            return
         state = self._join_verify_state.pop((group_id, user_id), None)
         if state is None:
             return
         await self._kick_join_verify_user(
             state["event"], group_id, user_id, "人机验证超时未通过"
         )
+
+    def _cancel_all_join_verify(self) -> int:
+        """取消所有进行中的人机验证任务并清空状态（人机验证开关关闭 / 插件停用时调用）。
+
+        Returns:
+            取消的任务数量。
+        """
+        count = 0
+        for key, state in list(self._join_verify_state.items()):
+            task = state.get("task")
+            if task and not task.done():
+                task.cancel()
+            self._join_verify_state.pop(key, None)
+            count += 1
+        if count:
+            logger.info(f"{LOG_PREFIX} 已取消 {count} 个进行中的人机验证任务")
+        return count
+
+    async def terminate(self):
+        """插件卸载/停用时的清理钩子：取消所有进行中的人机验证任务，杜绝幽灵踢人。"""
+        try:
+            self._cancel_all_join_verify()
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 插件停用清理人机验证任务异常: {e}")
 
     async def _kick_join_verify_user(
         self, event: AstrMessageEvent, group_id: str, user_id: str, reason: str
@@ -689,7 +748,10 @@ class QQGroupAdminPlugin(Star):
         Returns:
             字典：{"failures": 累计失败次数, "remaining": 剩余机会次数（-1 表示未设置次数限制）, "blacklisted": 是否已拉黑}
         """
-        max_failures = int(self.config.get("join_verify_max_failures", 0) or 0)
+        try:
+            max_failures = int(self.config.get("join_verify_max_failures", 0) or 0)
+        except (ValueError, TypeError):
+            max_failures = 0
         if max_failures <= 0:
             # 未启用次数限制：仍记录失败次数（仅统计），不自动拉黑、剩余不限；
             # 手动拉黑的用户保持拉黑状态
@@ -735,14 +797,13 @@ class QQGroupAdminPlugin(Star):
     async def on_group_add_request(self, event: AstrMessageEvent):
         """
         监听加群申请事件，按配置的等级门槛与入群白词自动处理入群申请。
-        - 自动拒绝（独立功能，不受自动同意开关控制）：
+        - 自动拒绝（两个独立开关；开启「拒绝入群双重验证」（auto_reject_dual_verify）后需两个拒绝条件同时满足才拒绝，关闭则任一满足即拒绝）：
           - auto_reject_below_level 开启且申请人 QQ 等级低于门槛时，自动拒绝入群。
           - auto_reject_whitelist_miss 开启且申请人验证信息未命中任何入群白词时，自动拒绝入群。
-        - 自动同意（受 auto_accept_group_request 开关控制）：开关开启时：
-          - 仅配置白词：验证信息命中任一白词 → 自动同意
-          - 仅配置等级门槛：等级达标 → 自动同意
-          - 白词与等级同时配置：需「白词命中 + 等级达标」双条件同时满足 → 自动同意
-          - 无任何门槛：所有申请自动同意
+        - 自动同意：
+          - 仅等级渠道（auto_accept_group_request）：等级达标（或无门槛）→ 自动同意，白词不参与。
+          - 仅白词渠道（auto_accept_whitelist）：验证信息命中任一白词 → 自动同意，不受等级门槛影响。
+          - 双开关同时开启时：开启「入群双重审核」（auto_accept_dual_verify）→ 需「白词命中（或未配置白词）」且「等级达标（或无门槛）」同时满足才自动同意（AND）；关闭 → 任一满足即自动同意（OR）。
         - 其余情况保持人工审核（不干预）。仅处理 add 类型申请；黑名单群不生效。
         """
         raw_msg = getattr(event.message_obj, "raw_message", {})
@@ -784,11 +845,26 @@ class QQGroupAdminPlugin(Star):
                 logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
             return
 
-        min_level = int(self.config.get("auto_accept_group_level", 0) or 0)
+        # 读取等级门槛并安全转换（防御非法配置值；填小数时直接截断保留整数部分，如 30.5 → 30；异常时按 0 处理 = 不限制等级）
+        try:
+            raw_level = self.config.get("auto_accept_group_level", 0) or 0
+            min_level = int(float(raw_level)) if float(raw_level) >= 0 else 0
+        except (ValueError, TypeError):
+            logger.warning(
+                f"{LOG_PREFIX} auto_accept_group_level 配置值非法，已按 0（不限制等级）处理"
+            )
+            min_level = 0
         reject_enabled = self.config.get("auto_reject_below_level", False)
         reject_whitelist_miss_enabled = self.config.get("auto_reject_whitelist_miss", False)
         accept_enabled = self.config.get("auto_accept_group_request", False)
-        whitelist = [str(w).strip() for w in (self.config.get("auto_accept_group_whitelist") or []) if str(w).strip()]
+        accept_whitelist_enabled = self.config.get("auto_accept_whitelist", False)
+        accept_dual_enabled = self.config.get("auto_accept_dual_verify", False)  # 入群双重审核：双同意开关同时开启时的 AND/OR 控制
+        reject_dual_enabled = self.config.get("auto_reject_dual_verify", False)  # 拒绝入群双重验证：双拒绝开关同时开启时的 AND/OR 控制
+        # 读取白词列表并做类型防御（面板配置为 list；若误配成字符串则视为单个白词，其他异常类型按空处理）
+        raw_whitelist = self.config.get("auto_accept_group_whitelist") or []
+        if not isinstance(raw_whitelist, (list, tuple, set)):
+            raw_whitelist = [raw_whitelist] if isinstance(raw_whitelist, str) and raw_whitelist.strip() else []
+        whitelist = [str(w).strip() for w in raw_whitelist if w is not None and str(w).strip()]
 
         # 读取申请人填写的验证信息
         comment = str(raw_dict.get("comment", "") or "")
@@ -819,65 +895,101 @@ class QQGroupAdminPlugin(Star):
         level_passed = (level >= min_level) if level_requirement else True
         whitelist_passed = any(w in comment for w in whitelist) if whitelist_requirement else True
 
-        # 1. 未命中入群白词：自动拒绝（独立开关，不受自动同意开关控制）
-        if whitelist_requirement and reject_whitelist_miss_enabled and not whitelist_passed:
-            try:
-                await call_onebot_action(
-                    event,
-                    "set_group_add_request",
-                    flag=str(flag),
-                    sub_type="add",
-                    approve=False,
-                    reason="入群验证信息未包含指定白词"
-                )
-                logger.info(
-                    f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（验证信息未命中入群白词）"
-                )
-            except Exception as e:
-                logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
-            return
-
-        # 2. 等级未达门槛：自动拒绝（独立功能）或保持人工审核
-        if level_requirement and not level_passed:
-            if reject_enabled:
-                try:
-                    await call_onebot_action(
-                        event,
-                        "set_group_add_request",
-                        flag=str(flag),
-                        sub_type="add",
-                        approve=False,
-                        reason=f"QQ等级未达到入群门槛（要求不低于{min_level}级）"
-                    )
-                    logger.info(
-                        f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（QQ等级 {level} < 门槛 {min_level}）"
-                    )
-                except Exception as e:
-                    logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+        # 1/2. 自动拒绝判定（两个独立拒绝开关）
+        #    - 开启「拒绝入群双重验证」（reject_dual_enabled）→ AND：两个拒绝条件同时满足才自动拒绝，只满足一个时不拦截
+        #    - 关闭（默认）→ OR：任一拒绝条件满足即自动拒绝（白词未命中优先于等级未达标）
+        wl_reject = whitelist_requirement and reject_whitelist_miss_enabled and not whitelist_passed
+        lv_reject = level_requirement and reject_enabled and not level_passed
+        if wl_reject or lv_reject:
+            if reject_dual_enabled:
+                # AND：需「白词未命中」且「等级未达标」同时满足才拒绝
+                if wl_reject and lv_reject:
+                    try:
+                        await call_onebot_action(
+                            event,
+                            "set_group_add_request",
+                            flag=str(flag),
+                            sub_type="add",
+                            approve=False,
+                            reason="入群验证信息未包含指定白词且QQ等级未达到入群门槛"
+                        )
+                        logger.info(
+                            f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（拒绝双重验证：白词未命中 且 QQ等级 {level} < 门槛 {min_level}）"
+                        )
+                    except Exception as e:
+                        logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+                    return
+                # 只满足一个拒绝条件 → 不拦截，继续走同意流程
             else:
-                logger.info(
-                    f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}），"
-                    f"申请人 QQ 等级 {level} 低于门槛 {min_level}，保持人工审核。"
-                )
-            return
+                # OR：任一满足即拒绝
+                if wl_reject:
+                    try:
+                        await call_onebot_action(
+                            event,
+                            "set_group_add_request",
+                            flag=str(flag),
+                            sub_type="add",
+                            approve=False,
+                            reason="入群验证信息未包含指定白词"
+                        )
+                        logger.info(
+                            f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（验证信息未命中入群白词）"
+                        )
+                    except Exception as e:
+                        logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+                    return
+                if lv_reject:
+                    try:
+                        await call_onebot_action(
+                            event,
+                            "set_group_add_request",
+                            flag=str(flag),
+                            sub_type="add",
+                            approve=False,
+                            reason=f"QQ等级未达到入群门槛（要求不低于{min_level}级）"
+                        )
+                        logger.info(
+                            f"{LOG_PREFIX} 自动拒绝入群：用户 {user_id} 申请加入群 {group_id}（QQ等级 {level} < 门槛 {min_level}）"
+                        )
+                    except Exception as e:
+                        logger.error(f"{LOG_PREFIX} 自动拒绝入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
+                    return
 
-        # 3. 自动同意开关未开启 → 不干预
-        if not accept_enabled:
+        # 3. 自动同意判定：
+        #    - 双开关同时开启 + 「入群双重审核」开启 → AND：白词命中（或未配置白词）且 等级达标（或无门槛）同时满足才自动同意
+        #    - 双开关同时开启 + 「入群双重审核」关闭（默认）→ OR：白词命中 或 等级达标，任一满足即自动同意
+        #    - 仅开等级开关 → 等级渠道独立：等级达标（或无门槛）即自动同意，白词不参与
+        #    - 仅开白词开关 → 白词渠道独立：验证信息命中白词即自动同意，等级门槛不参与
+        level_ok = (not level_requirement) or level_passed
+        whitelist_ok = (not whitelist_requirement) or whitelist_passed
+
+        if accept_enabled and accept_whitelist_enabled:
+            lv_desc = "无等级门槛" if not level_requirement else (f"QQ等级{level}≥{min_level}" if level_passed else f"QQ等级{level}<{min_level}")
+            wl_desc = "未配置白词" if not whitelist_requirement else ("白词命中" if whitelist_passed else "白词未命中")
+            if accept_dual_enabled:
+                agree_flag = level_ok and whitelist_ok
+                reason = f"双重审核（{wl_desc}且{lv_desc}）"
+            else:
+                agree_flag = level_ok or (whitelist_requirement and whitelist_passed)
+                reason = f"同意审核（{wl_desc}或{lv_desc}）"
+        elif accept_enabled:
+            agree_flag = level_ok
+            reason = f"等级渠道（{'无等级门槛，全部放行' if not level_requirement else (f'QQ等级{level}≥{min_level}' if level_passed else f'QQ等级{level}<{min_level}')}）"
+        elif accept_whitelist_enabled:
+            agree_flag = whitelist_requirement and whitelist_passed
+            reason = "白词渠道（验证信息命中白词）"
+        else:
+            agree_flag = False
+            reason = "未开启任何自动同意开关"
+
+        if not agree_flag:
             logger.info(
                 f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}），"
-                f"但自动同意入群开关未开启，保持人工审核。如需自动同意请在插件配置中开启 auto_accept_group_request。"
+                f"自动同意条件未满足（{reason}），保持人工审核。"
             )
             return
 
-        # 4. 存在白词门槛但验证信息未命中 → 不干预
-        if whitelist_requirement and not whitelist_passed:
-            logger.info(
-                f"{LOG_PREFIX} 收到加群申请（用户 {user_id} → 群 {group_id}），"
-                f"申请人验证信息未包含入群白词，保持人工审核。"
-            )
-            return
-
-        # 5. 全部条件满足 → 自动同意入群
+        # 4. 自动同意入群
         try:
             await call_onebot_action(
                 event,
@@ -886,22 +998,9 @@ class QQGroupAdminPlugin(Star):
                 sub_type="add",
                 approve=True
             )
-            if whitelist_requirement and level_requirement:
-                logger.info(
-                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（白词命中 + QQ等级 {level} ≥ 门槛 {min_level}）"
-                )
-            elif whitelist_requirement:
-                logger.info(
-                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（验证信息命中白词）"
-                )
-            elif level_requirement:
-                logger.info(
-                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（QQ等级 {level} ≥ 门槛 {min_level}）"
-                )
-            else:
-                logger.info(
-                    f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（无门槛）"
-                )
+            logger.info(
+                f"{LOG_PREFIX} 自动同意入群：用户 {user_id} 申请加入群 {group_id}（{reason}）"
+            )
         except Exception as e:
             logger.error(f"{LOG_PREFIX} 自动同意入群失败：用户 {user_id} → 群 {group_id}，错误: {e}")
 
@@ -1502,10 +1601,11 @@ class QQGroupAdminPlugin(Star):
         sort_by_join_time: bool = False,
         sort_by_last_sent_time: bool = False,
         sort_by_group_level: bool = False,
-        sort_oldest_first: bool = False
+        sort_oldest_first: bool = False,
+        summary_only: bool = False
     ) -> str:
         """
-        在 QQ 群聊中获取全员列表或根据关键词（昵称/名片/QQ号）搜索群成员，或按进群时间、最近发言时间、群等级进行多维度排序。当需要查找某群员信息、统计全员、查看最新进群新人、高/低群等级成员或按时间/等级升降序排列时调用（工具内部会自动校验调用者权限）。
+        在 QQ 群聊中获取全员列表或根据关键词（昵称/名片/QQ号）搜索群成员，或按进群时间、最近发言时间、群等级进行多维度排序，或统计各群等级人数分布。列表与关键词搜索默认展示前 30 人，超出时附「… 等共 N 人」总数提示。当需要查找某群员信息、统计全员、查看最新进群新人、高/低群等级成员、按时间/等级升降序排列，或统计“某个群等级有多少人”时调用（工具内部会自动校验调用者权限）。
 
         Args:
             keyword (str, optional): 搜索关键词，支持匹配昵称、群名片或QQ号。若为空则默认列出前 30 名成员。
@@ -1513,6 +1613,7 @@ class QQGroupAdminPlugin(Star):
             sort_by_last_sent_time (bool, optional): 是否按最近发言时间排序。当用户询问“最近谁发言了”、“最久没发言的人”、“按发言时间查看”时设置为 True。默认 False。
             sort_by_group_level (bool, optional): 是否按群等级排序。当用户询问“群等级最高/最低的人”、“按群等级排序”时设置为 True。默认 False。
             sort_oldest_first (bool, optional): 是否升序排序（从旧到新 / 从低到高）。当用户询问“最久没发言”、“最低群等级”、“最早进群”、“从小到大/升序”时设置为 True。默认 False（即默认降序：最新/最高）。
+            summary_only (bool, optional): 是否仅统计各群等级人数分布（遍历全部成员，不受 30 人展示截断影响）。当用户询问“某个群等级有多少人”、“群等级分布/人数统计”时设置为 True。开启后忽略 keyword 与排序参数。默认 False。
         """
         ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_member_list")
         if not ok:
@@ -1528,6 +1629,12 @@ class QQGroupAdminPlugin(Star):
             if not isinstance(res, list):
                 return f"获取群 ({group_id}) 成员列表数据失败。"
 
+            # 统计模式：遍历全部成员统计各群等级人数（不受 30 人展示截断影响）
+            if summary_only:
+                summary, total = summarize_group_level(res)
+                if not summary:
+                    return f"群 ({group_id}) 群等级人数统计失败或无有效成员数据。"
+                return f"群 ({group_id}) 群等级人数统计（共 {total} 人）：\n" + summary
             formatted, total_found = format_member_list(
                 res,
                 keyword=keyword,
