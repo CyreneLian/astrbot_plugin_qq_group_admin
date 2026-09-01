@@ -11,7 +11,7 @@
    - `kick_group_member`：将指定群成员移除群聊（踢人），支持是否同时拒绝后续加群申请（拉黑/黑名单）。
    - `delete_group_message`：撤回单条或多条指定消息，支持指定单个或多个 ID（用逗号/空格分隔）进行批量撤回，亦支持回复/引用消息时自动识别并撤回。
    - `set_group_essence_message`：设置或取消群精华消息，支持回复/引用消息时自动识别并设为精华/移除精华。
-   - `get_group_msg_history`：获取群聊历史消息记录（单次最多可调取 100 条历史记录），协助上下文寻找发言 ID。
+   - `get_group_msg_history`：获取群聊历史消息记录（单次最多可调取 500 条历史记录），协助上下文寻找发言 ID。
    - `set_group_whole_ban`：开启或解除全员禁言（全体禁言）。
    - `set_group_card`：设置或修改指定群成员的群名片/群昵称（支持重置清空名片）。
    - `set_group_special_title`：为指定群成员颁发专属头衔（支持指定有效天数或永久有效，需 Bot 为群主）。
@@ -145,8 +145,8 @@ astrbot_plugin_qq_group_admin/
 | 配置项 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `allow_bot_admin` | bool | `true` | **允许 Bot 超级管理员**（`admins_id` 列表中的账号）使用管理工具 |
-| `allow_group_owner` | bool | `true` | **允许目标群群主**使用管理工具（开启后，目标群的群主可让 Bot 执行群管理指令） |
-| `allow_group_admin` | bool | `true` | **允许目标群管理员**使用管理工具（开启后，目标群的管理员可让 Bot 执行群管理指令） |
+| `allow_group_owner` | bool | `true` | **允许目标群群主使用管理工具**（开启后，目标群的群主可让 Bot 执行群管理指令） |
+| `allow_group_admin` | bool | `true` | **允许目标群管理员使用管理工具**（开启后，目标群的管理员可让 Bot 执行群管理指令） |
 | `enable_at_feature` | bool | `true` | **允许 @ 成员功能**（开启后大模型可在回复中 @ 成员/全体成员，@全体成员需对应权限） |
 | `enable_poke_reply` | bool | `true` | **允许被戳一戳时自然回复**（开启后当有人戳 Bot 时按角色性格回应） |
 | `enable_group_decrease_notice` | bool | `true` | **退群提示开关**（开启后，有人退群时 Bot 会在群内提示「谁主动退群了」或「谁被管理员/群主移出群聊」；黑名单群不生效） |
@@ -211,5 +211,9 @@ astrbot_plugin_qq_group_admin/
 ## 仓库地址
 
 - [https://github.com/CyreneLian/astrbot_plugin_qq_group_admin](https://github.com/CyreneLian/astrbot_plugin_qq_group_admin)
+
+## 🤝 贡献与支持
+
+欢迎提交 Issue 和 Pull Request 来帮助改进本插件。
 
 ## 如果这个插件对你有帮助，欢迎给个 ⭐ Star！

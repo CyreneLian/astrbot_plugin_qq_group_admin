@@ -472,11 +472,21 @@ class QQGroupAdminPlugin(Star):
 
         # 安全读取超时与错误次数配置（防御非法配置值，异常时使用默认值，与配置面板默认对齐）
         try:
-            timeout = max(10, int(self.config.get("join_verify_timeout", 180) or 180))
+            raw = self.config.get("join_verify_timeout", 180) or 180
+            if isinstance(raw, float) and raw != int(raw):
+                raise TypeError("不接受小数")
+            if int(raw) < 0:
+                raise ValueError("不接受负数")
+            timeout = max(10, int(raw))
         except (ValueError, TypeError):
             timeout = 180
         try:
-            max_attempts = max(1, int(self.config.get("join_verify_max_attempts", 3) or 3))
+            raw = self.config.get("join_verify_max_attempts", 3) or 3
+            if isinstance(raw, float) and raw != int(raw):
+                raise TypeError("不接受小数")
+            if int(raw) < 0:
+                raise ValueError("不接受负数")
+            max_attempts = max(1, int(raw))
         except (ValueError, TypeError):
             max_attempts = 3
 
@@ -487,7 +497,7 @@ class QQGroupAdminPlugin(Star):
                 Plain(
                     f" 欢迎入群！请完成人机验证：\n"
                     f"请计算 {expr} = ?\n"
-                    f"请直接回复数字答案（限 {timeout} 秒内，答错 {max_attempts} 次将被移出群聊）"
+                    f"请直接回复整数答案（限 {timeout} 秒内，答错 {max_attempts} 次将被移出群聊）"
                 ),
             ]))
         except Exception as e:
@@ -525,7 +535,7 @@ class QQGroupAdminPlugin(Star):
         if not self._join_verify_state:
             return
 
-        # 跳过 notice/request 等系统事件（其 message_str 为空，会导致误触发「请直接回复数字答案」提示）
+        # 跳过 notice/request 等系统事件（其 message_str 为空，会导致误触发「请直接回复整数答案」提示）
         raw_msg = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw_msg, dict) and raw_msg.get("post_type") in ("notice", "request"):
             return
@@ -554,7 +564,7 @@ class QQGroupAdminPlugin(Star):
         if not content or not content.isdigit():
             await event.send(event.chain_result([
                 At(qq=sender_id),
-                Plain(" 请直接回复数字答案"),
+                Plain(" 请直接回复整数答案"),
             ]))
             # 终止事件传播：避免待验证用户 @Bot 的消息继续触发 LLM 调用
             event.stop_event()
@@ -749,7 +759,12 @@ class QQGroupAdminPlugin(Star):
             字典：{"failures": 累计失败次数, "remaining": 剩余机会次数（-1 表示未设置次数限制）, "blacklisted": 是否已拉黑}
         """
         try:
-            max_failures = int(self.config.get("join_verify_max_failures", 0) or 0)
+            raw = self.config.get("join_verify_max_failures", 0) or 0
+            if isinstance(raw, float) and raw != int(raw):
+                raise TypeError("不接受小数")
+            if int(raw) < 0:
+                raise ValueError("不接受负数")
+            max_failures = int(raw)
         except (ValueError, TypeError):
             max_failures = 0
         if max_failures <= 0:
@@ -848,7 +863,11 @@ class QQGroupAdminPlugin(Star):
         # 读取等级门槛并安全转换（防御非法配置值；填小数时直接截断保留整数部分，如 30.5 → 30；异常时按 0 处理 = 不限制等级）
         try:
             raw_level = self.config.get("auto_accept_group_level", 0) or 0
-            min_level = int(float(raw_level)) if float(raw_level) >= 0 else 0
+            if isinstance(raw_level, float) and raw_level != int(raw_level):
+                raise TypeError("不接受小数")
+            if int(raw_level) < 0:
+                raise ValueError("不接受负数")
+            min_level = int(raw_level)
         except (ValueError, TypeError):
             logger.warning(
                 f"{LOG_PREFIX} auto_accept_group_level 配置值非法，已按 0（不限制等级）处理"
@@ -1243,20 +1262,20 @@ class QQGroupAdminPlugin(Star):
         self,
         event: AstrMessageEvent,
         message_seq: str = "",
-        count: int = 20
+        count: int = 50
     ) -> str:
         """
         在 QQ 群聊中获取历史消息记录列表。当需要查看群内近期发言、寻找特定成员发出的消息 ID（以协助撤回或设为精华）时调用（工具内部会自动校验调用者权限）。
 
         Args:
             message_seq (str, optional): 起始消息序号/ID。若为空则调取最新发送的历史消息。
-            count (int, optional): 获取条数，范围 1~100。默认 20 条。
+            count (int, optional): 获取条数，范围 1~500。默认 50 条。
         """
         ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_msg_history")
         if not ok:
             return err_msg
 
-        count = max(1, min(100, count))
+        count = max(1, min(500, count))
 
         try:
             kwargs = {
