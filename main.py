@@ -52,7 +52,7 @@ logger = logging.getLogger("astrbot")
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
     "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。",
-    "3.0.1",
+    "3.0.2",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
 class QQGroupAdminPlugin(Star):
@@ -1052,8 +1052,7 @@ class QQGroupAdminPlugin(Star):
         self,
         event: AstrMessageEvent,
         target_user: str,
-        duration_minutes: int,
-        reason: str = ""
+        duration_minutes: int
     ) -> str:
         """
         在 QQ 群聊中对违规或指定的群成员执行禁言或解除禁言操作。当用户提出明确要求时调用（工具内部会自动校验调用者权限）。
@@ -1061,7 +1060,6 @@ class QQGroupAdminPlugin(Star):
         Args:
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
             duration_minutes (int): 禁言时长（单位：分钟）。如果为 0 则代表解除禁言。
-            reason (str, optional): 禁言或解禁的原因或说明。
         """
         cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
@@ -1082,11 +1080,10 @@ class QQGroupAdminPlugin(Star):
                 user_id=int(cleaned_target),
                 duration=duration_seconds
             )
-            reason_info = f"，原因：{reason}" if reason else ""
             if duration_seconds > 0:
-                return f"成功：以 [{auth_role}] 身份将成员 ({cleaned_target}) 禁言 {duration_minutes} 分钟{reason_info}。"
+                return f"成功：以 [{auth_role}] 身份将成员 ({cleaned_target}) 禁言 {duration_minutes} 分钟。"
             else:
-                return f"成功：以 [{auth_role}] 身份为成员 ({cleaned_target}) 解除了禁言{reason_info}。"
+                return f"成功：以 [{auth_role}] 身份为成员 ({cleaned_target}) 解除了禁言。"
         except Exception as e:
             err_str = str(e)
             logger.error(f"{LOG_PREFIX} 执行 {action_name} 失败: {err_str}")
@@ -1099,8 +1096,7 @@ class QQGroupAdminPlugin(Star):
         self,
         event: AstrMessageEvent,
         target_user: str,
-        reject_add_request: bool = False,
-        reason: str = ""
+        reject_add_request: bool = False
     ) -> str:
         """
         在 QQ 群聊中将指定成员移除群聊（踢出群聊）。当用户提出明确要求时调用（工具内部会自动校验调用者权限）。
@@ -1108,7 +1104,6 @@ class QQGroupAdminPlugin(Star):
         Args:
             target_user (str): 目标用户的 QQ 号，或消息中 @ 目标的纯数字 ID/文本。
             reject_add_request (bool, optional): 是否同时拒绝该用户后续的加群申请（拉黑/黑名单）。默认 False。
-            reason (str, optional): 移除群聊的原因或说明。
         """
         cleaned_target = clean_qq_number(target_user)
         if not cleaned_target:
@@ -1127,8 +1122,7 @@ class QQGroupAdminPlugin(Star):
                 reject_add_request=reject_add_request
             )
             block_info = "（已同步拒绝后续加群申请）" if reject_add_request else ""
-            reason_info = f"，原因：{reason}" if reason else ""
-            return f"成功：以 [{auth_role}] 身份已将成员 ({cleaned_target}) 移除群聊{block_info}{reason_info}。"
+            return f"成功：以 [{auth_role}] 身份已将成员 ({cleaned_target}) 移除群聊{block_info}。"
         except Exception as e:
             err_str = str(e)
             retcode = getattr(e, "retcode", None)
@@ -1148,9 +1142,8 @@ class QQGroupAdminPlugin(Star):
                     lowered = True
             if lowered:
                 block_info = "（已同步拒绝后续加群申请）" if reject_add_request else ""
-                reason_info = f"，原因：{reason}" if reason else ""
                 return (
-                    f"成功：以 [{auth_role}] 身份已将成员 ({cleaned_target}) 移除群聊{block_info}{reason_info}。"
+                    f"成功：以 [{auth_role}] 身份已将成员 ({cleaned_target}) 移除群聊{block_info}。"
                     f"（注意：NapCat 返回 retcode={retcode}，踢人已生效，但附加操作可能未完全成功，"
                     f"详情请查看 NapCat 日志）"
                 )

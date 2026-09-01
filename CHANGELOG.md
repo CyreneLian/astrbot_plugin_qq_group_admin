@@ -1,5 +1,16 @@
 # 📊 astrbot_plugin_qq_group_admin CHANGELOG
 
+## 🌸 v3.0.2 (2026-09-02)
+
+> **版本定位**：工具参数优化与配置校验加固等的不重磅升级小版本。
+
+- **历史消息上限提升**：`get_group_msg_history` 单次可调取的历史消息上限从 100 条提升至 500 条，协助大模型在更长跨度的上下文中寻找发言 ID。
+
+- **移除不必要的 `kick_group_member` 与 `ban_group_member` 的 `reason` 参数**：QQ 协议的踢人接口（`set_group_kick`）与禁言接口（`set_group_ban`）均不支持理由字段，移除后工具参数与协议能力完全对齐。
+
+- **四项配置校验加固**：`join_verify_timeout`（验证超时）、`join_verify_max_attempts`（最大错误次数）、`join_verify_max_failures`（拉黑阈值）与 `auto_accept_group_level`（等级门槛）新增类型与取值校验——小数与负数将被拒绝并回退默认值。
+- **人机验证提示文案调整**：验证提示由「数字答案」改为「整数答案」，与仅接受整数的配置校验保持一致。
+
 ## 🌸 v3.0.1 (2026-08-22)
 
 > **版本定位**：入群审核体系升级与多项优化与修复的不重磅升级小版本。
