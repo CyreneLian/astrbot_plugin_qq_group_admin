@@ -1,11 +1,11 @@
 """
-AstrBot QQ群大模型管理工具 v3.0.0
+AstrBot QQ群大模型管理工具 v3.1.0
 
 功能描述：
-- 提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。
+- 提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。
 
 作者: 往昔的涟漪
-版本: 3.0.0
+版本: 3.1.0
 日期: 2026-08-10
 """
 
@@ -47,14 +47,19 @@ from .utils import (
 
 logger = logging.getLogger("astrbot")
 
+# 默认欢迎词为空：自定义配置为空时，验证通过仅发送既有文案「✅ 验证成功，欢迎加入！」，不附加额外欢迎词
+DEFAULT_JOIN_WELCOME = ""
+
 
 @register(
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
-    "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核和人机验证等。",
-    "3.0.2",
+    "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。",
+    "3.1.0",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
+
+
 class QQGroupAdminPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -95,9 +100,11 @@ class QQGroupAdminPlugin(Star):
             self._verify_blacklist_file = os.path.join(
                 self._verify_data_dir, "join_verify_blacklist.json"
             )
+
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 初始化入群黑名单数据目录失败: {e}")
             self._verify_blacklist_file = ""
+
         # 从 context 获取 Bot 全局配置中的 admins_id 列表
         try:
             raw_admins = context.get_config().get("admins_id", [])
@@ -108,6 +115,51 @@ class QQGroupAdminPlugin(Star):
 
         # 正则表达式：用于匹配符合规范的艾特标签，例如 [at:123456] 或 [at:all]
         self.valid_at_pattern = AT_PATTERN
+
+    def _per_group_config_file(self) -> str:
+        """每群覆盖配置存储路径"""
+        return os.path.join(self._verify_data_dir, "per_group_config.json")
+
+    def _load_per_group_config(self) -> dict:
+        """读取每群覆盖配置：{group_id: {key: value}}，异常时返回空"""
+        try:
+            f = self._per_group_config_file()
+            if os.path.exists(f):
+                with open(f, "r", encoding="utf-8") as fp:
+                    data = json.loads(fp.read())
+                return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning(f"{LOG_PREFIX} 读取每群覆盖配置失败: {e}")
+        return {}
+
+    def _save_per_group_config(self, data: dict) -> None:
+        """保存每群覆盖配置"""
+        try:
+            f = self._per_group_config_file()
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w", encoding="utf-8") as fp:
+                fp.write(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} 保存每群覆盖配置失败: {e}")
+
+    def _effective_group_config(self, group_id: Any) -> dict:
+        """合并全局默认 + 每群覆盖，返回该群生效配置。
+
+        插件配置面板 = 默认值层；面板每群覆盖项优先，未覆盖则跟随全局默认。
+        """
+        override = self._load_per_group_config().get(str(group_id), {}) or {}
+        eff = {}
+        for key in (
+            "auto_accept_group_request", "auto_reject_below_level",
+            "auto_accept_group_whitelist", "auto_reject_whitelist_miss",
+            "auto_accept_group_level", "auto_accept_whitelist",
+            "auto_accept_dual_verify", "auto_reject_dual_verify",
+            "enable_join_verify", "join_verify_timeout",
+            "join_verify_max_attempts", "join_verify_max_failures",
+            "join_verify_welcome_msg",
+        ):
+            eff[key] = override.get(key) if key in override else self.config.get(key, None)
+        return eff
 
     @filter.on_llm_request()
     async def inject_at_instruction(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -376,12 +428,6 @@ class QQGroupAdminPlugin(Star):
         人机验证关闭时，黑名单等整套人机防线都不生效；
         开启时：黑名单用户发提示后移出群聊，其余新人触发随机加减法人机验证。
         """
-        # 人机验证总开关：关闭则整套人机防线（含黑名单）都不生效，
-        # 同时取消所有进行中的人机验证任务（防止残留任务继续答题/超时踢人）
-        if not self.config.get("enable_join_verify", False):
-            self._cancel_all_join_verify()
-            return
-
         raw_msg = getattr(event.message_obj, "raw_message", {})
         raw_dict = raw_msg if isinstance(raw_msg, dict) else {}
         if not raw_dict:
@@ -408,11 +454,34 @@ class QQGroupAdminPlugin(Star):
         user_id = str(raw_dict.get("user_id", "") or "")
         if not group_id or not user_id:
             return
+        # 每群生效配置（全局默认 + 每群覆盖）
+        _cfg = self._effective_group_config(group_id)
         # 排除 Bot 自己入群
         if str(user_id) == str(event.get_self_id()):
             return
         # 黑名单群不处理
         if is_blacklisted_group(self.config, group_id):
+            return
+        # 人机验证总开关关闭：整套人机防线（含黑名单用户拦截）不生效，
+        # 同时取消所有进行中的人机验证任务（防止残留任务继续答题/超时踢人）。
+        # 若配置了自定义入群欢迎词，入群时 @新人 发送；未配置则静默不发送。
+        if not _cfg.get("enable_join_verify", False):
+            try:
+                _welcome = str(_cfg.get("join_verify_welcome_msg", "") or "").strip()
+            except Exception:
+                _welcome = ""
+            if _welcome:
+                try:
+                    await event.send(event.chain_result([
+                        At(qq=user_id),
+                        Plain(f" {_welcome}"),
+                    ]))
+                    logger.info(
+                        f"{LOG_PREFIX} 自定义入群欢迎词已发送：用户 {user_id} 加入群 {group_id}"
+                    )
+                except Exception as e:
+                    logger.error(f"{LOG_PREFIX} 发送自定义入群欢迎词失败: {e}")
+            self._cancel_all_join_verify()
             return
         # Bot 权限自检：只在 Bot 为群主或管理员的群生效（否则无法踢人，无需验证）
         bot_role = await get_bot_role_in_group(event, group_id)
@@ -472,7 +541,7 @@ class QQGroupAdminPlugin(Star):
 
         # 安全读取超时与错误次数配置（防御非法配置值，异常时使用默认值，与配置面板默认对齐）
         try:
-            raw = self.config.get("join_verify_timeout", 180) or 180
+            raw = _cfg.get("join_verify_timeout", 180) or 180
             if isinstance(raw, float) and raw != int(raw):
                 raise TypeError("不接受小数")
             if int(raw) < 0:
@@ -481,7 +550,7 @@ class QQGroupAdminPlugin(Star):
         except (ValueError, TypeError):
             timeout = 180
         try:
-            raw = self.config.get("join_verify_max_attempts", 3) or 3
+            raw = _cfg.get("join_verify_max_attempts", 3) or 3
             if isinstance(raw, float) and raw != int(raw):
                 raise TypeError("不接受小数")
             if int(raw) < 0:
@@ -543,6 +612,8 @@ class QQGroupAdminPlugin(Star):
             return
 
         group_id = str(event.get_group_id() or "")
+        # 每群生效配置（全局默认 + 每群覆盖）
+        _cfg = self._effective_group_config(group_id)
         sender_id = str(event.get_sender_id() or "")
         key = (group_id, sender_id)
         state = self._join_verify_state.get(key)
@@ -576,10 +647,22 @@ class QQGroupAdminPlugin(Star):
             self._join_verify_state.pop(key, None)
             if state["task"]:
                 state["task"].cancel()
-            await event.send(event.chain_result([
-                At(qq=sender_id),
-                Plain(" ✅ 验证成功，欢迎加入！"),
-            ]))
+            # 入群欢迎词：配置了自定义欢迎词则只发送自定义内容（不再拼接验证成功文案）；
+            # 留空则仅发送验证成功反馈文案
+            try:
+                _welcome = str(_cfg.get("join_verify_welcome_msg", "") or "").strip()
+            except Exception:
+                _welcome = ""
+            if _welcome:
+                await event.send(event.chain_result([
+                    At(qq=sender_id),
+                    Plain(f" {_welcome}"),
+                ]))
+            else:
+                await event.send(event.chain_result([
+                    At(qq=sender_id),
+                    Plain(" ✅ 验证成功，欢迎加入！"),
+                ]))
             # 终止事件传播：避免 @Bot 的验证消息继续触发 LLM 调用
             event.stop_event()
             logger.info(f"{LOG_PREFIX} 人机验证通过：用户 {sender_id} 在群 {group_id}")
@@ -606,13 +689,15 @@ class QQGroupAdminPlugin(Star):
         self, group_id: str, user_id: str, timeout: int
     ):
         """超时未通过验证则移出群聊；若剩余时间少于 1 分钟仍未答对，先 @新人 提醒并重发题目。
+        # 每群生效配置（全局默认 + 每群覆盖）
+        _cfg = self._effective_group_config(group_id)
 
         每次唤醒先检查人机验证总开关：开关已关闭则静默取消本次验证（不提醒、不踢人）。
         """
         # 若总时限大于 60 秒，在剩余 60 秒时发送提醒并重发题目
         if timeout > 60:
             await asyncio.sleep(timeout - 60)
-            if not self.config.get("enable_join_verify", False):
+            if not _cfg.get("enable_join_verify", False):
                 self._join_verify_state.pop((group_id, user_id), None)
                 return  # 开关已关闭：静默取消，不提醒
             state = self._join_verify_state.get((group_id, user_id))
@@ -635,7 +720,7 @@ class QQGroupAdminPlugin(Star):
             await asyncio.sleep(timeout)
 
         # 超时未通过验证 → 移出群聊（踢人前再检查一次开关，关闭则静默取消，杜绝幽灵踢人）
-        if not self.config.get("enable_join_verify", False):
+        if not _cfg.get("enable_join_verify", False):
             self._join_verify_state.pop((group_id, user_id), None)
             return
         state = self._join_verify_state.pop((group_id, user_id), None)
@@ -837,13 +922,15 @@ class QQGroupAdminPlugin(Star):
         flag = raw_dict.get("flag")
         if not group_id or not user_id or not flag:
             return
+        # 每群生效配置（全局默认 + 每群覆盖）
+        _cfg = self._effective_group_config(group_id)
 
         # 黑名单群不自动处理
         if is_blacklisted_group(self.config, group_id):
             return
 
         # 入群黑名单用户：直接自动拒绝（仅人机验证开启时生效；关闭则整套人机防线停用）
-        if self.config.get("enable_join_verify", False) and self._is_join_verify_blacklisted(user_id):
+        if _cfg.get("enable_join_verify", False) and self._is_join_verify_blacklisted(user_id):
             try:
                 await call_onebot_action(
                     event,
@@ -862,7 +949,7 @@ class QQGroupAdminPlugin(Star):
 
         # 读取等级门槛并安全转换（防御非法配置值；填小数时直接截断保留整数部分，如 30.5 → 30；异常时按 0 处理 = 不限制等级）
         try:
-            raw_level = self.config.get("auto_accept_group_level", 0) or 0
+            raw_level = _cfg.get("auto_accept_group_level", 0) or 0
             if isinstance(raw_level, float) and raw_level != int(raw_level):
                 raise TypeError("不接受小数")
             if int(raw_level) < 0:
@@ -873,14 +960,14 @@ class QQGroupAdminPlugin(Star):
                 f"{LOG_PREFIX} auto_accept_group_level 配置值非法，已按 0（不限制等级）处理"
             )
             min_level = 0
-        reject_enabled = self.config.get("auto_reject_below_level", False)
-        reject_whitelist_miss_enabled = self.config.get("auto_reject_whitelist_miss", False)
-        accept_enabled = self.config.get("auto_accept_group_request", False)
-        accept_whitelist_enabled = self.config.get("auto_accept_whitelist", False)
-        accept_dual_enabled = self.config.get("auto_accept_dual_verify", False)  # 入群双重审核：双同意开关同时开启时的 AND/OR 控制
-        reject_dual_enabled = self.config.get("auto_reject_dual_verify", False)  # 拒绝入群双重验证：双拒绝开关同时开启时的 AND/OR 控制
+        reject_enabled = _cfg.get("auto_reject_below_level", False)
+        reject_whitelist_miss_enabled = _cfg.get("auto_reject_whitelist_miss", False)
+        accept_enabled = _cfg.get("auto_accept_group_request", False)
+        accept_whitelist_enabled = _cfg.get("auto_accept_whitelist", False)
+        accept_dual_enabled = _cfg.get("auto_accept_dual_verify", False)  # 入群双重审核：双同意开关同时开启时的 AND/OR 控制
+        reject_dual_enabled = _cfg.get("auto_reject_dual_verify", False)  # 拒绝入群双重验证：双拒绝开关同时开启时的 AND/OR 控制
         # 读取白词列表并做类型防御（面板配置为 list；若误配成字符串则视为单个白词，其他异常类型按空处理）
-        raw_whitelist = self.config.get("auto_accept_group_whitelist") or []
+        raw_whitelist = _cfg.get("auto_accept_group_whitelist") or []
         if not isinstance(raw_whitelist, (list, tuple, set)):
             raw_whitelist = [raw_whitelist] if isinstance(raw_whitelist, str) and raw_whitelist.strip() else []
         whitelist = [str(w).strip() for w in raw_whitelist if w is not None and str(w).strip()]

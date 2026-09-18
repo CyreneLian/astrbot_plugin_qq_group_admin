@@ -123,8 +123,23 @@
     });
   }
 
+  // 顶部加载光带控制：body.is-loading 时顶部移动横线动画。
+  // 计数版：多个请求并发时各自 +1/-1，全部完成才关闭，避免快的请求提前关掉光带
+  var _loadingCount = 0;
+  function setLoading(on) {
+    if (on) {
+      _loadingCount += 1;
+    } else {
+      _loadingCount = Math.max(0, _loadingCount - 1);
+    }
+    document.body.classList.toggle("is-loading", _loadingCount > 0);
+  }
+
   function loadAll() {
     resetAllPending();
+    var pending = 2;
+    function allDone() { if (--pending <= 0) setLoading(false); }
+    setLoading(true);
     apiGet("overview")
       .then(function (data) {
         _maxFailures = data.max_failures != null ? data.max_failures : 0;
@@ -143,7 +158,8 @@
       })
       .catch(function (e) {
         showToast("加载概览失败：" + e.message);
-      });
+      })
+      .finally(allDone);
 
     apiGet("users")
       .then(function (users) {
@@ -156,7 +172,8 @@
           (e && e.message ? e.message : "未知错误") +
           "</td></tr>";
         showToast("加载用户列表失败：" + (e && e.message ? e.message : "未知错误"));
-      });
+      })
+      .finally(allDone);
   }
 
   // ---- 二次确认机制（iframe 内 confirm 可能被拦截，改用"再次点击确认"） ----
@@ -337,16 +354,278 @@
     });
   }
 
+  // ===== 视图切换（黑名单管理 / 入群工具管理）=====
+  window.switchView = function (view) {
+    document.querySelectorAll(".view").forEach(function (v) { v.style.display = "none"; });
+    document.querySelectorAll(".tab-btn").forEach(function (b) { b.classList.remove("active"); });
+    var target = document.querySelector(".view-" + view);
+    if (target) target.style.display = "";
+    var btn = document.querySelector('.tab-btn[data-view="' + view + '"]');
+    if (btn) btn.classList.add("active");
+    // 页面标题跟随视图：入群工具管理 ↔ 黑名单管理
+    var title = document.getElementById("pageTitle");
+    if (title) title.textContent = view === "tools" ? "入群工具管理" : "黑名单管理";
+    // 切入群工具管理 → 刷新群列表；切黑名单管理 → 刷新黑名单数据（都带顶部加载光带）
+    if (view === "tools") { loadDefaults(); loadGroups(); }
+    else if (view === "blacklist") loadAll();
+  };
+
+  // ===== 入群工具管理：群列表 =====
+  function roleLabel(role) {
+    if (role === "owner") return { text: "群主", cls: "role-owner" };
+    if (role === "admin" || role === "administrator") return { text: "管理员", cls: "role-admin" };
+    if (role === "member") return { text: "成员", cls: "role-member" };
+    return { text: "未知", cls: "role-unknown" };
+  }
+
+  function renderGroups(groups) {
+    var box = document.getElementById("groups-list");
+    if (!groups || !groups.length) {
+      box.innerHTML = '<div class="empty">未获取到 Bot 所在群（请确认 Bot 已加入群聊且平台正常）</div>';
+      return;
+    }
+    // 排序：Bot 有管理员/群主权限的群排上面，普通成员/未知权限排下面
+    groups = groups.slice().sort(function (a, b) {
+      function rank(r) {
+        if (r === "owner") return 0;
+        if (r === "admin" || r === "administrator") return 1;
+        if (r === "member") return 2;
+        return 3;
+      }
+      return rank(a.bot_role) - rank(b.bot_role);
+    });
+    box.innerHTML = groups.map(function (g) {
+      var role = roleLabel(g.bot_role);
+      var canPerm = ["owner", "admin", "administrator"].indexOf(g.bot_role) !== -1;
+      var cfg = g.config || {};
+      var dd = window._defaultsData || {};
+      var permTip = canPerm ? "" : '<div class="perm-tip">Bot 无管理权限：自动同意/拒绝、人机验证等权限项不可调节（欢迎词仍可设置）</div>';
+      // 每个设置项所属的总开关（插件配置面板的全局默认）；欢迎词无总开关、永可调
+      var MASTER = {
+        auto_accept_group_request: "auto_accept_group_request",
+        auto_reject_below_level: "auto_reject_below_level",
+        auto_accept_whitelist: "auto_accept_whitelist",
+        auto_reject_whitelist_miss: "auto_reject_whitelist_miss",
+        auto_accept_dual_verify: "auto_accept_dual_verify",
+        auto_reject_dual_verify: "auto_reject_dual_verify",
+        auto_accept_group_level: "auto_accept_group_request",
+        auto_accept_group_whitelist: "auto_accept_whitelist",
+        enable_join_verify: "enable_join_verify",
+        join_verify_timeout: "enable_join_verify",
+        join_verify_max_attempts: "enable_join_verify",
+        join_verify_max_failures: "enable_join_verify",
+        join_verify_welcome_msg: ""
+      };
+      // 禁用原因：无权限或总开关未开 → 返回原因文案（空=不禁用）；欢迎词永不禁用
+      function disabledReason(key) {
+        var m = MASTER[key];
+        if (m === "") return "";
+        if (!canPerm) return "Bot 在群内无管理权限，无法调节";
+        if (m && !dd[m]) return "总开关未开启，需在插件配置面板开启";
+        return "";
+      }
+      // 禁用时把提示挂到外层 .cfg-item 的 data-tip（自定义 tooltip，hover 立即显示；
+      // disabled 元素本身不响应 hover，所以不放在 input 上）
+      function sw(key, label) {
+        var r = disabledReason(key);
+        return '<div class="cfg-item"' + (r ? ' data-tip="' + r + '"' : '') + '><span class="cfg-label">' + label + '</span><label class="cfg-switch"><input type="checkbox" data-gid="' + g.group_id + '" data-key="' + key + '"' +
+          (cfg[key] ? " checked" : "") + (r ? " disabled" : "") + "></label></div>";
+      }
+      function num(key, hint) {
+        var r = disabledReason(key);
+        return '<div class="cfg-item"' + (r ? ' data-tip="' + r + '"' : '') + '><label>' + hint + '</label><input type="number" data-gid="' + g.group_id + '" data-key="' + key +
+          '" value="' + (cfg[key] === null || cfg[key] === undefined ? "" : cfg[key]) + '"' + (r ? " disabled" : "") + '></div>';
+      }
+      function txt(key, hint) {
+        var r = disabledReason(key);
+        return '<div class="cfg-item cfg-item-wide"' + (r ? ' data-tip="' + r + '"' : '') + '><label>' + hint + '</label><input type="text" data-gid="' + g.group_id + '" data-key="' + key +
+          '" value="' + (cfg[key] || "") + '" placeholder="留空跟随插件默认"' + (r ? " disabled" : "") + '></div>';
+      }
+      return (
+        '<div class="group-card" data-gid="' + g.group_id + '">' +
+        '<div class="group-card-header">' +
+        '<span class="group-id">群号 ' + g.group_id + '</span>' +
+        '<span class="group-name">' + (g.group_name ? g.group_name : "") + '</span>' +
+        '<span class="role-badge ' + role.cls + '">' + role.text + '</span>' +
+        '<span class="override-badge ' + (g.overridden ? "on" : "") + '">' + (g.overridden ? "已覆盖" : "跟随默认") + "</span>" +
+        "</div>" +
+        '<div class="cfg-grid">' +
+        sw("auto_accept_group_request", "等级达标自动同意") +
+        sw("auto_reject_below_level", "等级未达自动拒绝") +
+        sw("auto_accept_whitelist", "白词命中自动同意") +
+        sw("auto_reject_whitelist_miss", "未命中白词自动拒绝") +
+        sw("auto_accept_dual_verify", "入群双重审核") +
+        sw("auto_reject_dual_verify", "拒绝入群双重验证") +
+        num("auto_accept_group_level", "QQ 等级门槛（0=不限）") +
+        txt("auto_accept_group_whitelist", "白词列表（逗号分隔）") +
+        "</div>" +
+        '<div class="cfg-grid">' +
+        sw("enable_join_verify", "开启人机验证") +
+        num("join_verify_timeout", "验证超时（秒）") +
+        num("join_verify_max_attempts", "最大错误次数") +
+        num("join_verify_max_failures", "拉黑阈值（0=不限）") +
+        "</div>" +
+        '<div class="cfg-section-title">入群欢迎词</div>' +
+        '<div class="cfg-grid">' +
+        txt("join_verify_welcome_msg", "自定义欢迎词") +
+        "</div>" + permTip +
+        '<div class="group-card-actions">' +
+        '<button class="btn btn-sm" onclick="resetGroupConfig(\'' + g.group_id + '\')">重置本群为默认</button>' +
+        "</div>" +
+        "</div>"
+      );
+    }).join("");
+  }
+
+  function loadDefaults() {
+    var box = document.getElementById("defaultsPanel");
+    if (box) box.innerHTML = '<span class="tools-hint">加载默认值…</span>';
+    apiGet("defaults")
+      .then(function (data) {
+        window._defaultsData = (data && data.defaults) || null;
+        renderDefaults(window._defaultsData);
+      })
+      .catch(function () {
+        window._defaultsData = null;
+        var b = document.getElementById("defaultsPanel"); if (b) b.innerHTML = "";
+        renderMasterTip(null);
+      });
+  }
+
+  function renderDefaults(d) {
+    var box = document.getElementById("defaultsPanel");
+    if (!box) return;
+    if (!d) { box.innerHTML = ""; return; }
+    function row(k, v) { return '<div class="defs-row"><span>' + k + '</span><b>' + v + '</b></div>'; }
+    function onoff(v) { return v ? "开启" : "关闭"; }
+    var wl = Array.isArray(d.auto_accept_group_whitelist)
+      ? d.auto_accept_group_whitelist.join("、")
+      : (d.auto_accept_group_whitelist || "");
+    box.innerHTML =
+      '<div class="defs-group"><div class="defs-title">🚪 自动同意 / 拒绝入群默认值</div>' +
+      row("等级达标自动同意", onoff(d.auto_accept_group_request)) +
+      row("等级未达自动拒绝", onoff(d.auto_reject_below_level)) +
+      row("白词命中自动同意", onoff(d.auto_accept_whitelist)) +
+      row("未命中白词自动拒绝", onoff(d.auto_reject_whitelist_miss)) +
+      row("入群双重审核", onoff(d.auto_accept_dual_verify)) +
+      row("拒绝入群双重验证", onoff(d.auto_reject_dual_verify)) +
+      row("QQ 等级门槛", (d.auto_accept_group_level || 0) > 0 ? d.auto_accept_group_level + " 级" : "0（不限）") +
+      row("白词列表", wl ? wl : "未设置") +
+      '</div><div class="defs-group"><div class="defs-title">🛡️ 入群人机验证默认值</div>' +
+      row("验证", onoff(d.enable_join_verify)) +
+      row("验证超时", (d.join_verify_timeout || 0) + " 秒") +
+      row("最大错误次数", (d.join_verify_max_attempts || 0) + " 次") +
+      row("拉黑阈值", (d.join_verify_max_failures || 0) > 0 ? d.join_verify_max_failures + " 次" : "0（不限制）") +
+      row("自定义欢迎词", d.join_verify_welcome_msg ? d.join_verify_welcome_msg : "未设置") +
+      '</div>';
+    renderMasterTip(d);
+  }
+
+  // 底部提示条：总开关未开启的项 + 前往插件配置面板指引
+  function renderMasterTip(d) {
+    var tip = document.getElementById("masterTip");
+    if (!tip) return;
+    if (!d) { tip.style.display = "none"; tip.innerHTML = ""; return; }
+    var off = [];
+    if (!d.auto_accept_group_request) off.push("等级达标自动同意");
+    if (!d.auto_reject_below_level) off.push("等级未达自动拒绝");
+    if (!d.auto_accept_whitelist) off.push("白词命中自动同意");
+    if (!d.auto_reject_whitelist_miss) off.push("未命中白词自动拒绝");
+    if (!d.auto_accept_dual_verify) off.push("入群双重审核");
+    if (!d.auto_reject_dual_verify) off.push("拒绝入群双重验证");
+    if (!d.enable_join_verify) off.push("入群人机验证");
+    if (!off.length) { tip.style.display = "none"; tip.innerHTML = ""; return; }
+    tip.style.display = "";
+    tip.innerHTML = '⚠️ 总开关未开启：' + off.join("、") + '——对应设置不可调节，请前往 AstrBot 插件配置面板「自动同意入群工具 / 入群人机验证工具」分组开启';
+  }
+
+  function loadGroups() {
+    var box = document.getElementById("groups-list");
+    if (box) box.innerHTML = "加载中...";
+    setLoading(true);
+    apiGet("groups")
+      .then(function (data) { renderGroups(data || []); })
+      .catch(function (e) { showToast("加载群列表失败：" + (e && e.message ? e.message : e)); })
+      .finally(function () { setLoading(false); });
+  }
+
+  // 保存单键覆盖（change 即保存；空值 = 取消覆盖跟随默认）
+  window.saveGroupConfig = function (gid, key, value) {
+    apiPost("group-config", { group_id: gid, key: key, value: value })
+      .then(function (resp) {
+        showToast("已保存");
+        // 局部更新「跟随默认 / 已覆盖」徽章（不重建列表，保留编辑状态）
+        var card = document.querySelector('.group-card[data-gid="' + gid + '"]');
+        if (card) {
+          var badge = card.querySelector(".override-badge");
+          if (badge) {
+            var on = !!(resp && resp.overridden);
+            badge.textContent = on ? "已覆盖" : "跟随默认";
+            badge.classList.toggle("on", on);
+          }
+        }
+      })
+      .catch(function (e) {
+        if (e && e.code === "NO_PERMISSION") showToast(e.message || "无权限修改该项");
+        else showToast("保存失败：" + (e && e.message ? e.message : e));
+      });
+  };
+
+  window.resetGroupConfig = function (gid) {
+    apiPost("group-config-reset", { group_id: gid })
+      .then(function (resp) {
+        showToast("已重置为插件默认值");
+        var card = document.querySelector('.group-card[data-gid="' + gid + '"]');
+        // 刷新效果：扫光动画（先移除类→强制重排→再添加，保证重复点击也能重新播放）
+        if (card) {
+          card.classList.remove("refreshing");
+          void card.offsetWidth;
+          card.classList.add("refreshing");
+        }
+        // 局部更新该群卡片：控件恢复插件默认值、徽章变「跟随默认」，不刷新整个列表
+        if (card && resp && resp.config) {
+          card.querySelectorAll("[data-key]").forEach(function (el) {
+            var v = resp.config[el.dataset.key];
+            if (el.type === "checkbox") {
+              el.checked = !!v;
+            } else {
+              el.value = (v === null || v === undefined) ? "" : v;
+            }
+          });
+          var badge = card.querySelector(".override-badge");
+          if (badge) {
+            badge.textContent = "跟随默认";
+            badge.classList.remove("on");
+          }
+        }
+      })
+      .catch(function (e) { showToast("重置失败：" + (e && e.message ? e.message : e)); });
+  };
+
+  // 事件委托：开关/输入的变更即保存
+  document.addEventListener("change", function (e) {
+    var el = e.target;
+    if (!el || !el.dataset || !el.dataset.key) return;
+    var gid = el.dataset.gid;
+    var key = el.dataset.key;
+    if (!gid || !key) return;
+    var val = el.type === "checkbox" ? el.checked : el.value;
+    saveGroupConfig(gid, key, val);
+  });
+
   // 暴露给全局（供 HTML onclick 使用）
   window.handleReset = handleReset;
   window.handleToggle = handleToggle;
   window.handleAddBlacklist = handleAddBlacklist;
   window.handleClear = handleClear;
   window.loadAll = loadAll;
+  window.loadGroups = loadGroups;
 
   // 等 bridge 就绪后初始化
   function init() {
     loadAll();
+    loadDefaults();
+    loadGroups();
   }
   if (bridge && typeof bridge.ready === "function") {
     bridge.ready().then(init);

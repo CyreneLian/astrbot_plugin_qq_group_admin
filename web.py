@@ -24,6 +24,19 @@ PLUGIN_NAME = "astrbot_plugin_qq_group_admin"
 PLUGIN_DATA_DIR = "astrbot_plugin_qq_group_admin"
 BLACKLIST_FILENAME = "join_verify_blacklist.json"
 
+# 面板可覆盖的每群配置键（与 main.py _effective_group_config 一致）
+PER_GROUP_KEYS = (
+    "auto_accept_group_request", "auto_reject_below_level",
+    "auto_accept_group_whitelist", "auto_reject_whitelist_miss",
+    "auto_accept_group_level", "auto_accept_whitelist",
+    "auto_accept_dual_verify", "auto_reject_dual_verify",
+    "enable_join_verify", "join_verify_timeout",
+    "join_verify_max_attempts", "join_verify_max_failures",
+    "join_verify_welcome_msg",
+)
+# 需要 Bot 群管理权限才能生效的键（欢迎词仅是发消息，无需权限）
+PER_GROUP_PERM_KEYS = set(PER_GROUP_KEYS) - {"join_verify_welcome_msg"}
+
 
 class JoinVerifyWebController:
     """入群审核管理面板控制器。"""
@@ -63,6 +76,85 @@ class JoinVerifyWebController:
             return int(self.config.get("join_verify_max_failures", 0) or 0)
         except (TypeError, ValueError):
             return 0
+
+    def _per_group_config_file(self) -> str:
+        return os.path.join(
+            get_astrbot_plugin_data_path(), PLUGIN_DATA_DIR, "per_group_config.json"
+        )
+
+    def _load_per_group_config(self) -> dict:
+        try:
+            f = self._per_group_config_file()
+            if os.path.exists(f):
+                with open(f, "r", encoding="utf-8") as fh:
+                    data = json.loads(fh.read())
+                return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 读取每群覆盖配置失败: {e}")
+        return {}
+
+    def _save_per_group_config(self, data: dict) -> None:
+        try:
+            f = self._per_group_config_file()
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.error(f"[{PLUGIN_NAME}] 保存每群覆盖配置失败: {e}")
+
+    def _effective_group_config(self, group_id: Any) -> dict:
+        """合并全局默认 + 每群覆盖（插件配置面板 = 默认值层）"""
+        override = self._load_per_group_config().get(str(group_id), {}) or {}
+        eff = {}
+        for key in PER_GROUP_KEYS:
+            eff[key] = override.get(key) if key in override else self.config.get(key, None)
+        return eff
+
+    @staticmethod
+    def _value_same(a, b) -> bool:
+        """宽容比较两个配置值是否相同（处理 checkbox bool / 数字字符串 / list 白词等类型差异）"""
+        if isinstance(b, bool):
+            try:
+                return bool(a) == b
+            except Exception:
+                return False
+        if isinstance(b, (int, float)) and not isinstance(b, bool):
+            try:
+                return float(a) == float(b)
+            except (TypeError, ValueError):
+                return False
+        if isinstance(b, list):
+            if isinstance(a, list):
+                return a == b
+            return str(a or "").strip() == ",".join(str(x).strip() for x in b).strip()
+        return str(a or "").strip() == str(b or "").strip()
+
+    async def _resolve_bot_role(self, group_id: Any) -> str:
+        """查询 Bot 在指定群的角色（owner/admin/member）；失败返回空串"""
+        try:
+            pm = getattr(self.context, "platform_manager", None)
+            platforms = getattr(pm, "platform_insts", None) or []
+            for platform in platforms:
+                try:
+                    client = platform.get_client() if hasattr(platform, "get_client") else None
+                    if not client:
+                        continue
+                    login = await self._client_call_action(client, "get_login_info")
+                    bot_self_id = login.get("user_id") if isinstance(login, dict) else None
+                    if not bot_self_id:
+                        continue
+                    info = await self._client_call_action(
+                        client, "get_group_member_info",
+                        group_id=int(group_id), user_id=int(bot_self_id), no_cache=True,
+                    )
+                    if isinstance(info, dict):
+                        return str(info.get("role", "member")).lower()
+                except Exception as e:
+                    logger.debug(f"[{PLUGIN_NAME}] 查询角色失败 group={group_id}: {e}")
+                    continue
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 查询 Bot 群角色失败: {e}")
+        return ""
 
     @staticmethod
     def _check_quart_available() -> None:
@@ -341,6 +433,135 @@ class JoinVerifyWebController:
 
     # ---------- 路由注册 ----------
 
+    async def page_defaults(self):
+        """插件默认值（入群工具管理面板顶部展示）"""
+        cfg = self.config
+        def g(k, d=None):
+            try:
+                return cfg.get(k, d)
+            except Exception:
+                return d
+        return self._jsonify({"ok": True, "defaults": {
+            "auto_accept_group_request": g("auto_accept_group_request", False),
+            "auto_reject_below_level": g("auto_reject_below_level", False),
+            "auto_accept_whitelist": g("auto_accept_whitelist", False),
+            "auto_reject_whitelist_miss": g("auto_reject_whitelist_miss", False),
+            "auto_accept_group_level": g("auto_accept_group_level", 0),
+            "auto_accept_group_whitelist": g("auto_accept_group_whitelist", ""),
+            "auto_accept_dual_verify": g("auto_accept_dual_verify", False),
+            "auto_reject_dual_verify": g("auto_reject_dual_verify", False),
+            "enable_join_verify": g("enable_join_verify", False),
+            "join_verify_timeout": g("join_verify_timeout", 180),
+            "join_verify_max_attempts": g("join_verify_max_attempts", 3),
+            "join_verify_max_failures": g("join_verify_max_failures", 0),
+            "join_verify_welcome_msg": g("join_verify_welcome_msg", ""),
+        }})
+
+    async def page_groups(self):
+        """群列表：群号、群名、Bot 角色、当前生效配置与覆盖标记"""
+        groups = []
+        try:
+            pm = getattr(self.context, "platform_manager", None)
+            platforms = getattr(pm, "platform_insts", None) or []
+            per_group = self._load_per_group_config()
+            for platform in platforms:
+                try:
+                    client = platform.get_client() if hasattr(platform, "get_client") else None
+                    if not client:
+                        continue
+                    login = await self._client_call_action(client, "get_login_info")
+                    bot_self_id = login.get("user_id") if isinstance(login, dict) else None
+                    group_list = await self._client_call_action(client, "get_group_list")
+                    if not isinstance(group_list, list):
+                        continue
+                    for g in group_list:
+                        gid = str(g.get("group_id", "")) if isinstance(g, dict) else ""
+                        if not gid:
+                            continue
+                        role = ""
+                        if bot_self_id:
+                            try:
+                                info = await self._client_call_action(
+                                    client, "get_group_member_info",
+                                    group_id=int(gid), user_id=int(bot_self_id), no_cache=True,
+                                )
+                                if isinstance(info, dict):
+                                    role = str(info.get("role", "member")).lower()
+                            except Exception:
+                                role = ""
+                        eff = self._effective_group_config(gid)
+                        groups.append({
+                            "group_id": gid,
+                            "group_name": g.get("group_name", "") or "",
+                            "bot_role": role,
+                            "config": eff,
+                            "overridden": gid in per_group,
+                        })
+                except Exception as e:
+                    logger.warning(f"[{PLUGIN_NAME}] 获取群列表失败: {e}")
+                    continue
+        except Exception as e:
+            return self._jsonify({"ok": False, "message": f"获取群列表失败: {e}"})
+        return self._jsonify({"ok": True, "data": groups})
+
+    async def page_group_config_set(self):
+        """保存某群覆盖配置：{group_id, key, value}。需权限的键在 Bot 无管理权限时拒绝。"""
+        payload = await quart_request_obj.get_json(force=True, silent=True) or {}
+        group_id = str(payload.get("group_id", "")).strip()
+        key = str(payload.get("key", "")).strip()
+        if not group_id:
+            return self._jsonify({"ok": False, "message": "缺少 group_id 参数"})
+        if key not in PER_GROUP_KEYS:
+            return self._jsonify({"ok": False, "message": f"不允许覆盖的配置项: {key}"})
+        # 权限校验：需要管理权限的键，Bot 非群主/管理员时拒绝
+        if key in PER_GROUP_PERM_KEYS:
+            role = await self._resolve_bot_role(group_id)
+            if role not in ("owner", "admin", "administrator"):
+                return self._jsonify({
+                    "ok": False,
+                    "code": "NO_PERMISSION",
+                    "message": "Bot 在该群无管理员/群主权限，无法修改该配置项",
+                })
+        data = self._load_per_group_config()
+        record = data.setdefault(group_id, {})
+        value = payload.get("value")
+        default_val = self.config.get(key) if hasattr(self.config, "get") else None
+        # 空值或与插件默认一致 → 取消该键覆盖（跟随全局默认，不残留「已覆盖」）
+        if value is None or value == "" or (default_val is not None and self._value_same(value, default_val)):
+            record.pop(key, None)
+        else:
+            record[key] = value
+        if not record:
+            data.pop(group_id, None)
+        self._save_per_group_config(data)
+        still_overridden = group_id in data and bool(data.get(group_id))
+        return self._jsonify({"ok": True, "message": "已保存", "overridden": still_overridden})
+
+    async def page_group_config_reset(self):
+        """重置某群覆盖（删除全部或指定键）：{group_id, key?}"""
+        payload = await quart_request_obj.get_json(force=True, silent=True) or {}
+        group_id = str(payload.get("group_id", "")).strip()
+        key = str(payload.get("key", "")).strip()
+        if not group_id:
+            return self._jsonify({"ok": False, "message": "缺少 group_id 参数"})
+        data = self._load_per_group_config()
+        if group_id not in data:
+            return self._jsonify({"ok": True, "message": "该群无覆盖配置"})
+        if key:
+            data[group_id].pop(key, None)
+            if not data[group_id]:
+                data.pop(group_id, None)
+        else:
+            data.pop(group_id, None)
+        self._save_per_group_config(data)
+        # 返回重置后的生效配置（= 全局默认值），供前端局部更新卡片
+        return self._jsonify({
+            "ok": True,
+            "message": "已重置为插件默认值",
+            "overridden": False,
+            "config": self._effective_group_config(group_id),
+        })
+
     def register_routes(self) -> None:
         routes = [
             ("/overview", self.page_overview, ["GET"], "入群审核概览"),
@@ -350,6 +571,12 @@ class JoinVerifyWebController:
             ("/toggle-blacklist", self.page_toggle_blacklist, ["POST"], "拉黑/解除用户入群黑名单"),
             ("/add-blacklist", self.page_add_blacklist, ["POST"], "手动拉黑用户"),
             ("/clear", self.page_clear, ["POST"], "清空入群黑名单"),
+        ]
+        routes += [
+            ("/defaults", self.page_defaults, ["GET"], "入群工具管理·插件默认值"),
+            ("/groups", self.page_groups, ["GET"], "入群工具管理·群列表"),
+            ("/group-config", self.page_group_config_set, ["POST"], "入群工具管理·保存每群覆盖配置"),
+            ("/group-config-reset", self.page_group_config_reset, ["POST"], "入群工具管理·重置每群覆盖配置"),
         ]
         for path, handler, methods, desc in routes:
             self.context.register_web_api(

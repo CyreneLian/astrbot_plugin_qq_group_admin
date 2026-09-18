@@ -3,66 +3,85 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>多群共享黑名单管理</title>
+  <title>入群审核管理</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
+  <div class="top-loader" id="topLoader"></div>
   <div class="page">
     <header class="page-header">
-      <h1>多群共享黑名单管理</h1>
-      <p class="subtitle">查看和管理各用户已消耗的入群验证次数与黑名单状态，各个群共享入群次数和黑名单，关闭入群人机验证后黑名单防护也会失效</p>
+      <h1 id="pageTitle">入群工具管理</h1>
+      <p class="subtitle">黑名单管理与每群入群工具管理细致化管理，面板未设置的群跟随插件配置默认值，Bot 无管理权限的群，对应权限项不可调节。</p>
+      <nav class="view-tabs">
+        <button class="tab-btn active" data-view="tools" onclick="switchView('tools')">入群工具管理</button>
+        <button class="tab-btn" data-view="blacklist" onclick="switchView('blacklist')">黑名单管理</button>
+      </nav>
     </header>
 
-    <section class="overview">
-      <div class="stat-card">
-        <div class="stat-value" id="stat-total">-</div>
-        <div class="stat-label">记录总数</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value" id="stat-blacklisted">-</div>
-        <div class="stat-label">黑名单人数</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value" id="stat-failures">-</div>
-        <div class="stat-label">累计失败次数</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value" id="stat-max">-</div>
-        <div class="stat-label">拉黑阈值</div>
-      </div>
-    </section>
+    <!-- ===== 黑名单管理视图 ===== -->
+    <div class="view view-blacklist" style="display:none;">
+      <section class="overview">
+        <div class="stat-card">
+          <div class="stat-value" id="stat-total">-</div>
+          <div class="stat-label">记录总数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-blacklisted">-</div>
+          <div class="stat-label">黑名单人数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-failures">-</div>
+          <div class="stat-label">累计失败次数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-max">-</div>
+          <div class="stat-label">拉黑阈值</div>
+        </div>
+      </section>
 
-    <div class="note-banner">
-      已拉黑的用户即使调大总次数，剩余机会也恒为 0 次；未拉黑的用户即使调小总次数，也至少保留 1 次入群机会。
+      <div class="note-banner">
+        已拉黑的用户即使调大总次数，剩余机会也恒为 0 次；未拉黑的用户即使调小总次数，也至少保留 1 次入群机会。
+      </div>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>用户记录</h2>
+          <div class="panel-actions">
+            <input type="text" id="input-add-user" class="input-add" placeholder="输入QQ号拉黑" />
+            <button class="btn btn-danger" id="btn-add" onclick="handleAddBlacklist()">拉黑</button>
+            <button class="btn btn-danger" id="btn-clear" onclick="handleClear()">清空全部失败记录</button>
+            <button class="btn" id="btn-refresh" onclick="loadAll()">刷新</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>QQ 号</th>
+                <th>失败次数</th>
+                <th>剩余机会</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="user-tbody">
+              <tr><td colspan="5" class="empty">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
 
-    <section class="panel">
-      <div class="panel-header">
-        <h2>用户记录</h2>
-        <div class="panel-actions">
-          <input type="text" id="input-add-user" class="input-add" placeholder="输入QQ号拉黑" />
-          <button class="btn btn-danger" id="btn-add" onclick="handleAddBlacklist()">拉黑</button>
-          <button class="btn btn-danger" id="btn-clear" onclick="handleClear()">清空全部失败记录</button>
-          <button class="btn" id="btn-refresh" onclick="loadAll()">刷新</button>
-        </div>
+    <!-- ===== 入群工具管理视图 ===== -->
+    <div class="view view-tools">
+      <div class="tools-toolbar">
+        <button class="btn" id="btn-refresh-groups" onclick="loadGroups()">刷新群列表</button>
       </div>
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>QQ 号</th>
-              <th>失败次数</th>
-              <th>剩余机会</th>
-              <th>状态</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody id="user-tbody">
-            <tr><td colspan="5" class="empty">加载中...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+      <div class="defs-hint">默认值修改请前往 AstrBot 插件配置面板「自动同意入群工具 / 入群人机验证工具」分组</div>
+      <div class="defs-wrap" id="defaultsPanel"></div>
+      <div id="masterTip" class="master-tip" style="display:none"></div>
+      <div id="groups-list" class="groups-list">加载中...</div>
+    </div>
 
     <div class="toast" id="toast"></div>
 
