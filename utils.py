@@ -12,7 +12,6 @@ AstrBot QQ群大模型管理工具 - 通用工具函数模块
 """
 
 import datetime
-import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,7 +20,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from .constants import LOG_PREFIX
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 
 async def call_onebot_action(

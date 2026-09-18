@@ -11,7 +11,6 @@ AstrBot QQ群大模型管理工具 - 权限校验模块
 日期: 2026-08-10
 """
 
-import logging
 from typing import Dict, Optional, Tuple
 
 from astrbot.api.event import AstrMessageEvent
@@ -25,7 +24,7 @@ from .constants import (
 )
 from .utils import call_onebot_action, is_blacklisted_group
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 
 async def check_permission(

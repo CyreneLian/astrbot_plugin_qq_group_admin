@@ -1,17 +1,16 @@
 """
-AstrBot QQ群大模型管理工具 v3.1.0
+AstrBot QQ群大模型管理工具 v3.1.1
 
 功能描述：
 - 提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。
 
 作者: 往昔的涟漪
-版本: 3.1.0
+版本: 3.1.1
 日期: 2026-08-10
 """
 
 import asyncio
 import json
-import logging
 import os
 import random
 import re
@@ -45,7 +44,7 @@ from .utils import (
     summarize_group_level,
 )
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 # 默认欢迎词为空：自定义配置为空时，验证通过仅发送既有文案「✅ 验证成功，欢迎加入！」，不附加额外欢迎词
 DEFAULT_JOIN_WELCOME = ""
@@ -55,7 +54,7 @@ DEFAULT_JOIN_WELCOME = ""
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
     "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。",
-    "3.1.0",
+    "3.1.1",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
 
@@ -174,7 +173,9 @@ class QQGroupAdminPlugin(Star):
         if is_blacklisted_group(self.config, event.get_group_id()):
             return
 
-        req.system_prompt = (req.system_prompt or "") + AT_INSTRUCTION
+        if req.system_prompt is None:
+            req.system_prompt = ""
+        req.system_prompt += AT_INSTRUCTION
 
     @filter.on_decorating_result(priority=2)
     async def process_at_tags(self, event: AstrMessageEvent):
