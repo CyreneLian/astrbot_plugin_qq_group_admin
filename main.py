@@ -1,11 +1,11 @@
 """
-AstrBot QQ群大模型管理工具 v3.1.1
+AstrBot QQ群大模型管理工具 v3.1.2
 
 功能描述：
 - 提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。
 
 作者: 往昔的涟漪
-版本: 3.1.1
+版本: 3.1.2
 日期: 2026-08-10
 """
 
@@ -54,7 +54,7 @@ DEFAULT_JOIN_WELCOME = ""
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
     "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。",
-    "3.1.1",
+    "3.1.2",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
 
@@ -158,6 +158,10 @@ class QQGroupAdminPlugin(Star):
             "join_verify_welcome_msg",
         ):
             eff[key] = override.get(key) if key in override else self.config.get(key, None)
+        # 总开关一票否决：全局「入群人机验证」关闭时，任何群（含每群覆盖）都不生效，
+        # 与面板置灰、黑名单跟随总开关的设计保持一致，杜绝「单群残留覆盖仍发题」的矛盾
+        if not self.config.get("enable_join_verify", False):
+            eff["enable_join_verify"] = False
         return eff
 
     @filter.on_llm_request()
@@ -482,7 +486,7 @@ class QQGroupAdminPlugin(Star):
                     )
                 except Exception as e:
                     logger.error(f"{LOG_PREFIX} 发送自定义入群欢迎词失败: {e}")
-            self._cancel_all_join_verify()
+            self._cancel_group_join_verify(group_id)
             return
         # Bot 权限自检：只在 Bot 为群主或管理员的群生效（否则无法踢人，无需验证）
         bot_role = await get_bot_role_in_group(event, group_id)
@@ -597,9 +601,12 @@ class QQGroupAdminPlugin(Star):
         监测待验证用户的群消息，判断其回复的答案是否正确。
         仅在存在待验证状态时介入，不影响其他消息的正常处理。
         """
-        # 人机验证总开关关闭：取消所有进行中的验证任务并停止处理（防止残留任务继续答题/踢人）
-        if not self.config.get("enable_join_verify", False):
-            self._cancel_all_join_verify()
+        group_id = str(event.get_group_id() or "")
+        # 每群生效配置（全局默认 + 每群覆盖）
+        _cfg = self._effective_group_config(group_id)
+        # 该群人机验证关闭：只清理该群的验证任务并停止处理（不误伤其他群）
+        if not _cfg.get("enable_join_verify", False):
+            self._cancel_group_join_verify(group_id)
             return
 
         if not self._join_verify_state:
@@ -612,9 +619,6 @@ class QQGroupAdminPlugin(Star):
         if not event.message_str or not event.message_str.strip():
             return
 
-        group_id = str(event.get_group_id() or "")
-        # 每群生效配置（全局默认 + 每群覆盖）
-        _cfg = self._effective_group_config(group_id)
         sender_id = str(event.get_sender_id() or "")
         key = (group_id, sender_id)
         state = self._join_verify_state.get(key)
@@ -690,11 +694,10 @@ class QQGroupAdminPlugin(Star):
         self, group_id: str, user_id: str, timeout: int
     ):
         """超时未通过验证则移出群聊；若剩余时间少于 1 分钟仍未答对，先 @新人 提醒并重发题目。
-        # 每群生效配置（全局默认 + 每群覆盖）
-        _cfg = self._effective_group_config(group_id)
-
         每次唤醒先检查人机验证总开关：开关已关闭则静默取消本次验证（不提醒、不踢人）。
         """
+        # 每群生效配置（全局默认 + 每群覆盖）
+        _cfg = self._effective_group_config(group_id)
         # 若总时限大于 60 秒，在剩余 60 秒时发送提醒并重发题目
         if timeout > 60:
             await asyncio.sleep(timeout - 60)
@@ -748,6 +751,21 @@ class QQGroupAdminPlugin(Star):
             logger.info(f"{LOG_PREFIX} 已取消 {count} 个进行中的人机验证任务")
         return count
 
+    def _cancel_group_join_verify(self, group_id: str) -> int:
+        """取消指定群的所有人机验证任务并清空状态（群级验证关闭时使用，不误伤其他群）。"""
+        count = 0
+        for (gid, uid), state in list(self._join_verify_state.items()):
+            if gid != group_id:
+                continue
+            task = state.get("task")
+            if task and not task.done():
+                task.cancel()
+            self._join_verify_state.pop((gid, uid), None)
+            count += 1
+        if count:
+            logger.info(f"{LOG_PREFIX} 已取消群 {group_id} 的 {count} 个人机验证任务")
+        return count
+
     async def terminate(self):
         """插件卸载/停用时的清理钩子：取消所有进行中的人机验证任务，杜绝幽灵踢人。"""
         try:
@@ -762,7 +780,7 @@ class QQGroupAdminPlugin(Star):
         记录一次失败次数，达到上限则自动拉入入群黑名单，并通过 OneBot API 真正拉入群聊黑名单。
         """
         # 记录人机验证失败次数，获取剩余机会与拉黑状态
-        info = await self._record_join_verify_failure(user_id)
+        info = await self._record_join_verify_failure(user_id, group_id)
         remaining = info["remaining"]
         blacklisted = info["blacklisted"]
 
@@ -838,14 +856,15 @@ class QQGroupAdminPlugin(Star):
         rec = data.get(str(user_id), {})
         return bool(rec.get("blacklisted", False))
 
-    async def _record_join_verify_failure(self, user_id: str) -> dict:
+    async def _record_join_verify_failure(self, user_id: str, group_id: str = "") -> dict:
         """记录一次人机验证失败；累计达到上限后自动拉入入群黑名单。
 
         Returns:
             字典：{"failures": 累计失败次数, "remaining": 剩余机会次数（-1 表示未设置次数限制）, "blacklisted": 是否已拉黑}
         """
+        _cfg = self._effective_group_config(group_id)
         try:
-            raw = self.config.get("join_verify_max_failures", 0) or 0
+            raw = _cfg.get("join_verify_max_failures", 0) or 0
             if isinstance(raw, float) and raw != int(raw):
                 raise TypeError("不接受小数")
             if int(raw) < 0:
