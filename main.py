@@ -1,11 +1,11 @@
 """
-AstrBot QQ群大模型管理工具 v3.1.2
+AstrBot QQ群大模型管理工具 v3.2.0
 
 功能描述：
 - 提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。
 
 作者: 往昔的涟漪
-版本: 3.1.2
+版本: 3.2.0
 日期: 2026-08-10
 """
 
@@ -54,7 +54,7 @@ DEFAULT_JOIN_WELCOME = ""
     "astrbot_plugin_qq_group_admin",
     "往昔的涟漪",
     "提供注册给大模型调用的全套 QQ 群管理与互动工具，可用自然语言指挥 Bot 进行群管理操作，并支持自动入群审核、人机验证和面板精细化管理等。",
-    "3.1.2",
+    "3.2.0",
     "https://github.com/CyreneLian/astrbot_plugin_qq_group_admin"
 )
 
@@ -156,12 +156,19 @@ class QQGroupAdminPlugin(Star):
             "enable_join_verify", "join_verify_timeout",
             "join_verify_max_attempts", "join_verify_max_failures",
             "join_verify_welcome_msg",
+            # 群聊管理与互动工具（每群可精细化调整）
+            "allow_bot_admin", "allow_group_owner", "allow_group_admin",
+            "enable_at_feature", "enable_poke_reply",
+            "enable_group_decrease_notice", "member_allowed_tools",
         ):
             eff[key] = override.get(key) if key in override else self.config.get(key, None)
-        # 总开关一票否决：全局「入群人机验证」关闭时，任何群（含每群覆盖）都不生效，
-        # 与面板置灰、黑名单跟随总开关的设计保持一致，杜绝「单群残留覆盖仍发题」的矛盾
+        # 总开关一票否决：全局开关关闭时，任何群（含每群覆盖）都不生效，
+        # 与面板置灰、黑名单跟随总开关的设计保持一致，杜绝「单群残留覆盖仍生效」的矛盾
         if not self.config.get("enable_join_verify", False):
             eff["enable_join_verify"] = False
+        for _k in ("enable_at_feature", "enable_poke_reply", "enable_group_decrease_notice"):
+            if not self.config.get(_k, True):
+                eff[_k] = False
         return eff
 
     @filter.on_llm_request()
@@ -170,8 +177,8 @@ class QQGroupAdminPlugin(Star):
         在 LLM 发出请求前注入艾特功能提示词，告知大模型如何格式化输出 [at:QQ号]。
         当配置中关闭「允许普通 @成员 功能」时，不注入该提示词。
         """
-        enable_at_feature = self.config.get("enable_at_feature", True)
-        if not enable_at_feature:
+        _cfg = self._effective_group_config(event.get_group_id())
+        if not _cfg.get("enable_at_feature", True):
             return
 
         if is_blacklisted_group(self.config, event.get_group_id()):
@@ -186,7 +193,7 @@ class QQGroupAdminPlugin(Star):
         """
         拦截器：在消息发送给用户前，将 [at:数字] 和 [at:all] 解析为平台原生的 At 组件，并补充防连连看字符。
         """
-        if not self.config.get("enable_at_feature", True):
+        if not self._effective_group_config(event.get_group_id()).get("enable_at_feature", True):
             return
 
         if is_blacklisted_group(self.config, event.get_group_id()):
@@ -273,7 +280,7 @@ class QQGroupAdminPlugin(Star):
         """
         监听并响应戳一戳事件：当有人戳 Bot 时，触发 LLM 根据角色性格回应戳一戳互动。
         """
-        if not self.config.get("enable_poke_reply", True):
+        if not self._effective_group_config(event.get_group_id()).get("enable_poke_reply", True):
             return
 
         raw_msg = getattr(event.message_obj, "raw_message", {})
@@ -368,7 +375,7 @@ class QQGroupAdminPlugin(Star):
         - kick_me：Bot 自己被移出 → 不提示
         受「退群提示开关」(enable_group_decrease_notice) 控制，黑名单群不生效。
         """
-        if not self.config.get("enable_group_decrease_notice", True):
+        if not self._effective_group_config(event.get_group_id()).get("enable_group_decrease_notice", True):
             return
 
         raw_msg = getattr(event.message_obj, "raw_message", {})
@@ -1139,11 +1146,11 @@ class QQGroupAdminPlugin(Star):
         在 QQ 群聊中请求 @全体成员 的操作授权与权限检测。当用户要求 @全体成员 或发布全群通知时调用此工具检测权限并获取授权（工具内部会自动校验调用者权限）。
         """
         # 0. 检查 @ 功能全局开关
-        if not self.config.get("enable_at_feature", True):
+        if not self._effective_group_config(event.get_group_id()).get("enable_at_feature", True):
             return "操作失败：管理员已在插件配置中关闭了 @ 成员功能（含 @全体成员）。"
 
         # 1. 检查发送者/操作者的权限
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="at_all_members")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="at_all_members")
         if not ok:
             return err_msg
 
@@ -1172,7 +1179,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="ban_group_member")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="ban_group_member")
         if not ok:
             return err_msg
 
@@ -1216,7 +1223,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="kick_group_member")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="kick_group_member")
         if not ok:
             return err_msg
 
@@ -1268,7 +1275,7 @@ class QQGroupAdminPlugin(Star):
         Args:
             message_id (str, optional): 需撤回的消息 ID（单条或以逗号/空格分隔的多条 ID）。若为空则优先提取当前回复引用的消息 ID。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="delete_group_message")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="delete_group_message")
         if not ok:
             return err_msg
 
@@ -1330,7 +1337,7 @@ class QQGroupAdminPlugin(Star):
             message_id (str, optional): 目标消息 ID。若为空则自动识别当前回复引用的消息 ID。
             enable (bool, optional): 是否设为精华。True 代表设为精华，False 代表移除精华。默认 True。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_essence_message")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="set_group_essence_message")
         if not ok:
             return err_msg
 
@@ -1371,7 +1378,7 @@ class QQGroupAdminPlugin(Star):
             message_seq (str, optional): 起始消息序号/ID。若为空则调取最新发送的历史消息。
             count (int, optional): 获取条数，范围 1~500。默认 50 条。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_msg_history")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="get_group_msg_history")
         if not ok:
             return err_msg
 
@@ -1413,7 +1420,7 @@ class QQGroupAdminPlugin(Star):
         Args:
             enable (bool, optional): 是否开启全员禁言。True 代表开启全员禁言，False 代表解除全员禁言。默认 True。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_whole_ban")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="set_group_whole_ban")
         if not ok:
             return err_msg
 
@@ -1450,7 +1457,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_card")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="set_group_card")
         if not ok:
             return err_msg
 
@@ -1490,7 +1497,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_special_title")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="set_group_special_title")
         if not ok:
             return err_msg
 
@@ -1530,7 +1537,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_admin")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="set_group_admin")
         if not ok:
             return err_msg
 
@@ -1565,7 +1572,7 @@ class QQGroupAdminPlugin(Star):
         if not group_name.strip():
             return "操作失败：新的群名称不能为空。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="set_group_name")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="set_group_name")
         if not ok:
             return err_msg
 
@@ -1603,7 +1610,7 @@ class QQGroupAdminPlugin(Star):
             content (str): 发布公告时的公告文案内容（仅 action="publish" 时需要）。
             notice_id (str): 删除公告时的公告 ID（仅 action="delete" 时需要）。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="send_group_notice")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="send_group_notice")
         if not ok:
             return err_msg
 
@@ -1681,7 +1688,7 @@ class QQGroupAdminPlugin(Star):
         """
         在 QQ 群聊中获取当前群聊的详细信息（群名称、群主 QQ、成员数、最大容量等）。当需要了解群基础信息时调用（工具内部会自动校验调用者权限）。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_info")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="get_group_info")
         if not ok:
             return err_msg
 
@@ -1734,7 +1741,7 @@ class QQGroupAdminPlugin(Star):
             sort_oldest_first (bool, optional): 是否升序排序（从旧到新 / 从低到高）。当用户询问“最久没发言”、“最低群等级”、“最早进群”、“从小到大/升序”时设置为 True。默认 False（即默认降序：最新/最高）。
             summary_only (bool, optional): 是否仅统计各群等级人数分布（遍历全部成员，不受 30 人展示截断影响）。当用户询问“某个群等级有多少人”、“群等级分布/人数统计”时设置为 True。开启后忽略 keyword 与排序参数。默认 False。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_member_list")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="get_group_member_list")
         if not ok:
             return err_msg
 
@@ -1807,7 +1814,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="group_poke")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="group_poke")
         if not ok:
             return err_msg
 
@@ -1848,7 +1855,7 @@ class QQGroupAdminPlugin(Star):
         if not cleaned_target:
             return f"操作失败：无法从输入 '{target_user}' 中解析出有效的 QQ 号。"
 
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="get_group_member_info")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="get_group_member_info")
         if not ok:
             return err_msg
 
@@ -1914,7 +1921,7 @@ class QQGroupAdminPlugin(Star):
             max_group_level (int, optional): 群等级上限门槛（如设为 10 代表仅清理群等级低于 LV.10 的成员）。0 代表不限制群等级。默认 0。
             confirm (bool, optional): 是否确认执行真正的清理踢人操作。默认 False（仅查询预览）。
         """
-        ok, auth_role, group_id, err_msg = await check_permission(event, self.config, self.admins_id, tool_name="kick_inactive_members")
+        ok, auth_role, group_id, err_msg = await check_permission(event, self._effective_group_config(event.get_group_id()), self.admins_id, tool_name="kick_inactive_members")
         if not ok:
             return err_msg
 

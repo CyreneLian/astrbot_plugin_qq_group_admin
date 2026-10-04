@@ -373,6 +373,32 @@ body {
   border-radius: 999px;
   color: #fff;
 }
+
+/* 群聊黑名单徽章 */
+.blacklist-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #fdecec;
+  color: #c0392b;
+  border: 1px solid #f5c2c0;
+  white-space: nowrap;
+}
+
+/* 黑名单提示条（与普通无权限提示区分） */
+.perm-tip-black {
+  background: #fdecec;
+  border-color: #f5c2c0;
+  color: #a93226;
+}
+/* 黑名单群卡片整体淡化，一眼看出不可用 */
+.group-card.is-blacklisted { opacity: .72; border-color: #f0cfcd; }
+.group-card.is-blacklisted:hover { opacity: 1; }
+
+/* 加入/移出黑名单按钮 */
+
 .role-owner { background: #e8a33d; }
 .role-admin { background: #3e9b5f; }
 .role-member { background: #8a99a9; }
@@ -389,12 +415,33 @@ body {
   font-size: 13px;
   font-weight: 700;
   color: #37506f;
-  margin: 12px 0 8px;
+  margin: 18px 0 10px;
+  padding-top: 12px;
+  border-top: 1px solid #e4ebf3;   /* 分区分隔线 */
+}
+/* 分组内第一个标题不重复画线（紧贴卡片头部时留白会更干净） */
+.group-card > .cfg-section-title:first-of-type {
+  margin-top: 14px;
 }
 .cfg-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   gap: 10px 16px;
+  padding: 12px 14px;
+  border: 1px solid #e9eff7;              /* 区域外框 */
+  border-radius: 10px;
+  background: #fafcff;                    /* 区域淡底 */
+}
+/* 多选工具区块与普通网格保持同样的框感 */
+.cfg-item-multi {
+  padding: 12px 14px;
+  border: 1px solid #e9eff7;
+  border-radius: 10px;
+  background: #fafcff;
+}
+.cfg-item-multi .cfg-multi-box {
+  border-color: #dde6f0;
+  background: #fff;
 }
 .cfg-item { display: flex; flex-direction: column; gap: 4px; }
 .cfg-item label { font-size: 12px; color: #6b7a8c; }
@@ -457,3 +504,75 @@ body:not(.is-loading) .panel,body:not(.is-loading) .group-card{transition:opacit
 .cfg-item[data-tip]{position:relative}
 .cfg-item[data-tip]:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 6px);left:0;z-index:50;background:#33475b;color:#fff;font-size:12px;line-height:1.4;padding:5px 10px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.22);pointer-events:none}
 .cfg-item[data-tip]:hover::before{content:"";position:absolute;bottom:100%;left:14px;border:5px solid transparent;border-top-color:#33475b;z-index:50;pointer-events:none}
+
+/* 普通群友可用工具：多选勾选框 */
+.cfg-item-multi .cfg-multi-box {
+  display: flex; flex-wrap: wrap; gap: 6px 10px;
+  padding: 8px 10px; margin-top: 4px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-subtle);
+}
+.cfg-item-multi .cfg-multi-box[disabled] { opacity: .6; cursor: not-allowed; }
+.cfg-multi-item { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
+.cfg-multi-item input { margin: 0; cursor: inherit; }
+.cfg-multi-item:hover span { color: var(--accent, #2f6fb3); }
+
+/* 深色模式下的分隔线与区域底色 */
+@media (prefers-color-scheme: dark) {
+  .cfg-section-title { color: #c8d8ec; border-top-color: #2a3a4f; }
+  .cfg-grid, .cfg-item-multi { border-color: #27374c; background: rgba(255,255,255,.02); }
+  .cfg-item-multi .cfg-multi-box { border-color: #2c3c52; background: rgba(0,0,0,.16); }
+}
+
+/* 「入群欢迎词」作为人机验证大区的收尾，不再重复画框，避免线套线 */
+.cfg-title-tail {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed #e4ebf3;   /* 虚线：表示同一大区的次级项 */
+}
+.cfg-grid-tail {
+  padding: 12px 14px;
+  border-style: dashed;
+  border-color: #e9eff7;
+  background: transparent;
+}
+
+/* ===== 群聊筛选栏 ===== */
+.filter-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
+  padding: 10px 14px; margin-bottom: 10px;
+  border: 1px solid #e4ebf3; border-radius: 10px; background: #fafcff;
+}
+.filter-row { display: flex; align-items: center; gap: 8px; }
+.filter-label {
+  font-size: 12px; color: #6b7a8c; font-weight: 600;
+  min-width: 52px; text-align: right;
+}
+.filter-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  padding: 3px 12px; font-size: 12px; line-height: 1.6;
+  border: 1px solid #d5deea; border-radius: 999px;
+  background: #fff; color: #4a5c70; cursor: pointer;
+  transition: all .15s ease; user-select: none;
+}
+.chip:hover { border-color: #a9c4e0; color: #2f6fb3; }
+.chip.active {
+  background: #2f6fb3; border-color: #2f6fb3; color: #fff; font-weight: 600;
+}
+.chip:focus-visible { outline: 2px solid #a9c4e0; outline-offset: 1px; }
+.filter-input {
+  width: 200px; padding: 5px 10px; font-size: 12px;
+  border: 1px solid #d5deea; border-radius: 8px; background: #fff; color: inherit;
+}
+.filter-input:focus { outline: none; border-color: #2f6fb3; }
+.filter-count { font-size: 12px; color: #8a97a5; white-space: nowrap; }
+.filter-reset { margin-left: auto; }
+
+@media (prefers-color-scheme: dark) {
+  .filter-bar { border-color: #27374c; background: rgba(255,255,255,.02); }
+  .filter-label { color: #8fa3b8; }
+  .chip { border-color: #2c3c52; background: rgba(0,0,0,.16); color: #b9c8d8; }
+  .chip:hover { border-color: #4a7ab5; color: #7fb0e0; }
+  .chip.active { background: #2f6fb3; border-color: #2f6fb3; color: #fff; }
+  .filter-input { border-color: #2c3c52; background: rgba(0,0,0,.16); color: #dce6f0; }
+  .filter-count { color: #7d90a5; }
+}

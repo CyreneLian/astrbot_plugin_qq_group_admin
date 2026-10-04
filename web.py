@@ -13,6 +13,8 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
+from .utils import is_blacklisted_group
+
 try:
     from quart import jsonify as quart_jsonify
     from quart import request as quart_request_obj
@@ -33,9 +35,26 @@ PER_GROUP_KEYS = (
     "enable_join_verify", "join_verify_timeout",
     "join_verify_max_attempts", "join_verify_max_failures",
     "join_verify_welcome_msg",
+    # 群聊管理与互动工具（每群可精细化调整）
+    "allow_bot_admin", "allow_group_owner", "allow_group_admin",
+    "enable_at_feature", "enable_poke_reply",
+    "enable_group_decrease_notice", "member_allowed_tools",
 )
-# 需要 Bot 群管理权限才能生效的键（欢迎词仅是发消息，无需权限）
-PER_GROUP_PERM_KEYS = set(PER_GROUP_KEYS) - {"join_verify_welcome_msg"}
+# 需要 Bot 群管理权限才能生效的键（仅限「Bot 必须在群里执行管理动作」的入群类操作）。
+# 其余均为纯设置项，与 Bot 在群内身份无关，面板一律可调：
+# - join_verify_welcome_msg：仅是发消息，无需权限
+# - allow_* / enable_poke_reply / enable_group_decrease_notice / member_allowed_tools：
+#   权限与互动开关
+# - enable_at_feature：「@某人」路径无任何权限校验；「@全体成员」走 at_all_members 工具，
+#   工具内部已自带 Bot 身份预检（见 main.py get_bot_role_in_group），失败会明确回报，
+#   无需在面板层连坐禁用——否则会连带禁用普通 @某人 功能。
+_NON_PERM_KEYS = {
+    "join_verify_welcome_msg",
+    "allow_bot_admin", "allow_group_owner", "allow_group_admin",
+    "enable_at_feature", "enable_poke_reply",
+    "enable_group_decrease_notice", "member_allowed_tools",
+}
+PER_GROUP_PERM_KEYS = set(PER_GROUP_KEYS) - _NON_PERM_KEYS
 
 
 class JoinVerifyWebController:
@@ -455,6 +474,14 @@ class JoinVerifyWebController:
             "join_verify_max_attempts": g("join_verify_max_attempts", 3),
             "join_verify_max_failures": g("join_verify_max_failures", 0),
             "join_verify_welcome_msg": g("join_verify_welcome_msg", ""),
+            # 群聊管理与互动工具（默认值层，面板可按群覆盖）
+            "allow_bot_admin": g("allow_bot_admin", True),
+            "allow_group_owner": g("allow_group_owner", True),
+            "allow_group_admin": g("allow_group_admin", True),
+            "enable_at_feature": g("enable_at_feature", True),
+            "enable_poke_reply": g("enable_poke_reply", True),
+            "enable_group_decrease_notice": g("enable_group_decrease_notice", True),
+            "member_allowed_tools": g("member_allowed_tools", []),
         }})
 
     async def page_groups(self):
@@ -496,6 +523,8 @@ class JoinVerifyWebController:
                             "bot_role": role,
                             "config": eff,
                             "overridden": gid in per_group,
+                            # 群聊黑名单标记：面板据此显示 🚫 徽章并禁用配置项
+                            "blacklisted": is_blacklisted_group(self.config, gid),
                         })
                 except Exception as e:
                     logger.warning(f"[{PLUGIN_NAME}] 获取群列表失败: {e}")

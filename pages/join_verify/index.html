@@ -77,6 +77,42 @@
       <div class="tools-toolbar">
         <button class="btn" id="btn-refresh-groups" onclick="loadGroups()">刷新群列表</button>
       </div>
+
+      <!-- ===== 群聊筛选栏 ===== -->
+      <div class="filter-bar">
+        <div class="filter-row">
+          <span class="filter-label">Bot 身份</span>
+          <div class="filter-chips" id="filter-role">
+            <button class="chip active" data-role="all" onclick="setFilter('role','all',this)">全部</button>
+            <button class="chip" data-role="owner" onclick="setFilter('role','owner',this)">群主</button>
+            <button class="chip" data-role="admin" onclick="setFilter('role','admin',this)">群管理员</button>
+            <button class="chip" data-role="member" onclick="setFilter('role','member',this)">普通成员</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">群聊状态</span>
+          <div class="filter-chips" id="filter-state">
+            <button class="chip active" data-state="all" onclick="setFilter('state','all',this)">全部</button>
+            <button class="chip" data-state="normal" onclick="setFilter('state','normal',this)">正常</button>
+            <button class="chip" data-state="black" onclick="setFilter('state','black',this)">黑名单</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">配置状态</span>
+          <div class="filter-chips" id="filter-conf">
+            <button class="chip active" data-conf="all" onclick="setFilter('conf','all',this)">全部</button>
+            <button class="chip" data-conf="over" onclick="setFilter('conf','over',this)">已覆盖</button>
+            <button class="chip" data-conf="follow" onclick="setFilter('conf','follow',this)">跟随默认</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">搜索</span>
+          <input type="text" id="filter-keyword" class="filter-input" placeholder="输入群号或群名关键词" oninput="applyFilters()" />
+          <span class="filter-count" id="filter-count"></span>
+        </div>
+        <button class="btn btn-sm filter-reset" onclick="resetFilters()">重置筛选</button>
+      </div>
+
       <div class="defs-hint">默认值修改请前往 AstrBot 插件配置面板「自动同意入群工具 / 入群人机验证工具」分组</div>
       <div class="defs-wrap" id="defaultsPanel"></div>
       <div id="masterTip" class="master-tip" style="display:none"></div>
