@@ -993,10 +993,16 @@ class QQGroupAdminPlugin(Star):
         accept_whitelist_enabled = _cfg.get("auto_accept_whitelist", False)
         accept_dual_enabled = _cfg.get("auto_accept_dual_verify", False)  # 入群双重审核：双同意开关同时开启时的 AND/OR 控制
         reject_dual_enabled = _cfg.get("auto_reject_dual_verify", False)  # 拒绝入群双重验证：双拒绝开关同时开启时的 AND/OR 控制
-        # 读取白词列表并做类型防御（面板配置为 list；若误配成字符串则视为单个白词，其他异常类型按空处理）
+        # 读取白词列表并做类型防御（面板配置为 list，同时兼容逗号分隔的字符串）
+        # 星涟补丁(v3.2.1)：面板白词输入框是单行文本框，实际存进 per_group_config 的
+        # 是逗号分隔的字符串，但 schema 声明的是 list。原逻辑把非 list 值整体包成单个
+        # 白词，逗号形同虚设——申请人只填其中一个词永远命中不了。
+        # 这里先把字符串按中英文逗号与顿号拆开，再统一走 list 清洗。
         raw_whitelist = _cfg.get("auto_accept_group_whitelist") or []
-        if not isinstance(raw_whitelist, (list, tuple, set)):
-            raw_whitelist = [raw_whitelist] if isinstance(raw_whitelist, str) and raw_whitelist.strip() else []
+        if isinstance(raw_whitelist, str):
+            raw_whitelist = re.split(r"[,，、]", raw_whitelist)
+        elif not isinstance(raw_whitelist, (list, tuple, set)):
+            raw_whitelist = []
         whitelist = [str(w).strip() for w in raw_whitelist if w is not None and str(w).strip()]
 
         # 读取申请人填写的验证信息
